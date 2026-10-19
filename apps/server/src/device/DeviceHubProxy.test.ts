@@ -8,16 +8,10 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
-import {
-  EnvironmentAuth,
-  ServerAuthMissingCredentialError,
-  ServerAuthSessionCredentialValidationError,
-  type ServerAuthCredentialError,
-  type ServerAuthInternalError,
-} from "../auth/EnvironmentAuth.ts";
-import { DeviceService } from "./DeviceService.ts";
-import { deviceHubProxyRouteLayer } from "./DeviceHubProxy.ts";
+import { HttpClient, HttpClientResponse, HttpRouter } from "effect/http";
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as DeviceService from "./DeviceService.ts";
+import * as DeviceHubProxy from "./DeviceHubProxy.ts";
 
 const disposers: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -27,13 +21,15 @@ afterEach(async () => {
 const fixture = (
   scopes: ReadonlyArray<AuthEnvironmentScope>,
   fail = false,
-  authError?: ServerAuthCredentialError | ServerAuthInternalError,
+  authError?: EnvironmentAuth.ServerAuthCredentialError | EnvironmentAuth.ServerAuthInternalError,
 ) => {
   let finalized = 0;
   const requests: string[] = [];
+  const headers: Array<Readonly<Record<string, string>>> = [];
   const client = HttpClient.make((request, _url, signal) =>
     Effect.gen(function* () {
       requests.push(request.url);
+      headers.push(request.headers);
       signal.addEventListener("abort", () => {
         finalized++;
       });
@@ -42,9 +38,9 @@ const fixture = (
     }),
   );
   const { handler, dispose } = HttpRouter.toWebHandler(
-    deviceHubProxyRouteLayer.pipe(
+    DeviceHubProxy.layer.pipe(
       Layer.provideMerge(
-        Layer.succeed(EnvironmentAuth, {
+        Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
           authenticateWebSocketUpgrade: () =>
             authError
               ? Effect.fail(authError)
@@ -54,20 +50,20 @@ const fixture = (
                   method: "bearer-access-token",
                   scopes,
                 }),
-        } as unknown as EnvironmentAuth["Service"]),
+        } as unknown as EnvironmentAuth.EnvironmentAuth["Service"]),
       ),
       Layer.provideMerge(
-        Layer.succeed(DeviceService, {
+        Layer.succeed(DeviceService.DeviceService, {
           currentReadiness: () =>
             Effect.succeed({ hostId: LOCAL_DEVICE_HOST_ID, hub: { origin: "http://hub.test" } }),
-        } as DeviceService["Service"]),
+        } as DeviceService.DeviceService["Service"]),
       ),
       Layer.provideMerge(Layer.succeed(HttpClient.HttpClient, client)),
     ),
     { disableLogger: true },
   );
   disposers.push(dispose);
-  return { handler, requests, finalized: () => finalized };
+  return { handler, requests, headers, finalized: () => finalized };
 };
 
 describe("device hub proxy", () => {
@@ -137,6 +133,25 @@ describe("device hub proxy", () => {
     ]);
   });
 
+  it("presents fold changes from an HTTPS client as same-origin hub requests", async () => {
+    const { handler, headers } = fixture([AuthOrchestrationOperateScope]);
+    const response = await handler(
+      new Request(
+        "https://relay.test/api/device-hub/vendor/serve-emu/api/fold?device=emulator-5554",
+        {
+          method: "POST",
+          headers: { origin: "https://relay.test", "x-forwarded-proto": "https" },
+          body: '{"posture":"opened"}',
+        },
+      ),
+    );
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(headers).toHaveLength(1);
+    expect(headers[0]?.origin).toBe("http://hub.test");
+    expect(headers[0]).not.toHaveProperty("x-forwarded-proto");
+  });
+
   it("never forwards the vendor shell endpoint", async () => {
     const { handler, requests } = fixture([AuthOrchestrationOperateScope]);
     expect(
@@ -151,9 +166,9 @@ describe("device hub proxy", () => {
 });
 
 it.each([
-  [new ServerAuthMissingCredentialError({}), 401],
+  [new EnvironmentAuth.ServerAuthMissingCredentialError({}), 401],
   [
-    new ServerAuthSessionCredentialValidationError({
+    new EnvironmentAuth.ServerAuthSessionCredentialValidationError({
       cause: new Error("private credential diagnostic"),
     }),
     500,
