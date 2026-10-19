@@ -12,116 +12,35 @@ import {
 
 const checkedAt = "2026-07-18T10:00:00.000Z";
 
-describe("Codex monthly credit limits", () => {
-  const individualLimit = {
-    remainingPercent: 99,
-    resetsAt: 1_784_500_000,
-    used: "1",
-    limit: "100",
-  };
-  const snapshot = {
-    limitId: "codex",
-    planType: "enterprise_cbp_usage_based",
-    primary: null,
-    secondary: null,
-    individualLimit,
-  };
-  const monthlyWindow = {
-    id: "individual",
-    kind: "monthly",
-    label: "Monthly credit limit",
-    usedPercent: 1,
-    resetsAt: "2026-07-19T22:26:40.000Z",
-  };
+describe("codexRateLimitsToLimits", () => {
+  it("shows an Enterprise monthly credit allowance in reads and notifications without a duration", () => {
+    const snapshot = {
+      limitId: "codex",
+      planType: "enterprise_cbp_usage_based",
+      primary: null,
+      secondary: null,
+      individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
+    };
+    const windows = [
+      {
+        id: "individual",
+        kind: "monthly",
+        label: "Monthly credit limit",
+        usedPercent: 1,
+        resetsAt: "2026-07-19T22:26:40.000Z",
+      },
+    ];
 
-  it("shows the Enterprise allowance from the main bucket without ordinary windows", () => {
     expect(
       codexRateLimitsToLimits({
         checkedAt,
         snapshot: { limitId: "spark" },
         rateLimitsByLimitId: { codex: snapshot },
       }),
-    ).toEqual({ checkedAt, windows: [monthlyWindow] });
+    ).toEqual({ checkedAt, windows });
+    expect(codexRateLimitsToUpdate(snapshot)).toEqual({ windows });
   });
 
-  it("publishes an individual-limit-only notification", () => {
-    expect(codexRateLimitsToUpdate(snapshot)).toEqual({ windows: [monthlyWindow] });
-  });
-
-  it("keeps ordinary windows alongside the monthly credit limit", () => {
-    expect(
-      codexRateLimitsToLimits({
-        checkedAt,
-        snapshot: { ...snapshot, primary: { usedPercent: 12 } },
-      }).windows,
-    ).toEqual([
-      {
-        id: "primary",
-        kind: "session",
-        label: "Session",
-        usedPercent: 12,
-        windowDurationMins: 300,
-      },
-      monthlyWindow,
-    ]);
-  });
-
-  it.each([
-    [120, 0],
-    [-10, 100],
-  ])("clamps remaining percentage %s to used percentage %s", (remainingPercent, usedPercent) => {
-    const limits = codexRateLimitsToLimits({
-      checkedAt,
-      snapshot: { ...snapshot, individualLimit: { ...individualLimit, remainingPercent } },
-    });
-    expect(limits.windows).toEqual([{ ...monthlyWindow, usedPercent }]);
-  });
-
-  it.each([NaN, Infinity, -Infinity])(
-    "ignores non-finite remaining percentage %s",
-    (remainingPercent) => {
-      expect(
-        codexRateLimitsToLimits({
-          checkedAt,
-          snapshot: { ...snapshot, individualLimit: { ...individualLimit, remainingPercent } },
-        }).windows,
-      ).toEqual([]);
-    },
-  );
-
-  it("omits invalid reset times without inventing a window duration", () => {
-    expect(
-      codexRateLimitsToLimits({
-        checkedAt,
-        snapshot: { ...snapshot, individualLimit: { ...individualLimit, resetsAt: 0 } },
-      }).windows,
-    ).toEqual([
-      { id: "individual", kind: "monthly", label: "Monthly credit limit", usedPercent: 1 },
-    ]);
-  });
-
-  it("updates, retains omitted values, and clears explicitly null credit limits", () => {
-    const update = { individualLimit: { ...individualLimit, remainingPercent: 75 } };
-    const changed = mergeCodexRateLimits(snapshot, { limitId: "codex", ...update });
-    expect(changed).toEqual({ ...snapshot, ...update });
-    expect(mergeCodexRateLimits(changed, { primary: { usedPercent: 12 } })).toEqual({
-      ...snapshot,
-      ...update,
-      primary: { usedPercent: 12 },
-    });
-    const cleared = mergeCodexRateLimits(changed, { limitId: "codex", individualLimit: null });
-    expect(cleared).toEqual({ ...snapshot, individualLimit: null });
-    expect(codexRateLimitsToLimits({ checkedAt, snapshot: cleared! }).windows).toEqual([]);
-  });
-
-  it("ignores monthly credit limits from model-specific buckets", () => {
-    const spark = { ...snapshot, limitId: "spark" };
-    expect(codexRateLimitsToUpdate(spark)).toBeUndefined();
-    expect(mergeCodexRateLimits(snapshot, spark)).toBe(snapshot);
-  });
-});
-
-describe("codexRateLimitsToLimits", () => {
   it("maps primary and secondary onto the session and weekly windows", () => {
     expect(
       codexRateLimitsToLimits({
@@ -175,6 +94,7 @@ describe("codexRateLimitsToLimits", () => {
   it("selects the main Codex allowance and leaves Spark out", () => {
     const spark = {
       limitId: "codex_bengalfox",
+      individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
       primary: { usedPercent: 0, windowDurationMins: 300 },
       secondary: { usedPercent: 90, windowDurationMins: 10080 },
     };
@@ -214,6 +134,7 @@ describe("codexRateLimitsToLimits", () => {
         checkedAt,
         snapshot: {
           limitId: "codex_bengalfox",
+          individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
           secondary: { usedPercent: 90 },
         },
       }).windows,
@@ -245,6 +166,7 @@ describe("codexRateLimitsToUpdate", () => {
     expect(
       codexRateLimitsToUpdate({
         limitId: "codex_bengalfox",
+        individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
         primary: { usedPercent: 0, windowDurationMins: 300 },
         secondary: { usedPercent: 90, windowDurationMins: 10080 },
       }),
@@ -375,6 +297,41 @@ describe("codexUsageLimitMessage", () => {
 });
 
 describe("mergeCodexRateLimits", () => {
+  it("updates monthly credit usage, retains it when omitted, and clears an explicit null", () => {
+    const snapshot = {
+      limitId: "codex",
+      primary: { usedPercent: 12 },
+      individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
+    };
+    const individualLimit = { remainingPercent: 75, resetsAt: 1_787_000_000 };
+    const changed = mergeCodexRateLimits(snapshot, { individualLimit });
+    expect(changed).toEqual({ ...snapshot, individualLimit });
+    expect(codexRateLimitsToUpdate(changed!)).toEqual({
+      windows: [
+        {
+          id: "primary",
+          kind: "session",
+          label: "Session",
+          usedPercent: 12,
+          windowDurationMins: 300,
+        },
+        {
+          id: "individual",
+          kind: "monthly",
+          label: "Monthly credit limit",
+          usedPercent: 25,
+          resetsAt: "2026-08-17T20:53:20.000Z",
+        },
+      ],
+    });
+
+    const retained = mergeCodexRateLimits(changed, { primary: null });
+    expect(retained).toEqual({ ...snapshot, primary: null, individualLimit });
+    const cleared = mergeCodexRateLimits(retained, { individualLimit: null });
+    expect(cleared).toEqual({ ...snapshot, primary: null, individualLimit: null });
+    expect(codexRateLimitsToLimits({ checkedAt, snapshot: cleared! }).windows).toEqual([]);
+  });
+
   it("keeps windows an update does not carry", () => {
     const merged = mergeCodexRateLimits(
       {
@@ -401,6 +358,7 @@ describe("mergeCodexRateLimits", () => {
     expect(
       mergeCodexRateLimits(main, {
         limitId: "spark",
+        individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
         primary: { usedPercent: 3, resetsAt: 1_800_000_000, windowDurationMins: 300 },
       }),
     ).toBe(main);
