@@ -815,6 +815,9 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         /^Bearer resource_metadata="http:\/\/[^"]+\/\.well-known\/oauth-protected-resource\/mcp"$/,
       );
 
+      const missingBearer = yield* call("");
+      expect(missingBearer.status).toBe(401);
+
       const wrongScheme = yield* call("credential", "Basic");
       expect(wrongScheme.status).toBe(401);
       expect(wrongScheme.headers["www-authenticate"]).toBe(missing.headers["www-authenticate"]);
@@ -829,6 +832,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
 
       expect(rejectionReasons).toEqual([
         "missing_authorization_header",
+        "missing_bearer_token",
         "unsupported_authorization_scheme",
         "unknown_or_expired_token",
         "unknown_or_expired_token",
