@@ -269,6 +269,25 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(layerEnvironmentAuth({ mode: "web", host: "192.168.1.50" }))),
   );
 
+  it.effect("authenticates MCP clients with a case-insensitive bearer scheme", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const issued = yield* serverAuth.issueMcpClientSession({
+        label: "lowercase-scheme-test",
+        access: "read-only",
+        client: { deviceType: "bot" },
+      });
+
+      const client = yield* serverAuth.authenticateMcpClient({
+        cookies: {},
+        headers: { authorization: `bearer ${issued.token}` },
+      } as never);
+
+      expect(client.sessionId).toBe(issued.sessionId);
+      expect(client.access).toBe("read-only");
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
   it.effect("preserves pairing grants after rejecting scopes they do not grant", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

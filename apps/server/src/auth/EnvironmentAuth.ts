@@ -588,7 +588,6 @@ type BootstrapExchangeResult = {
   readonly expireNormalCookie?: boolean;
 };
 
-const AUTHORIZATION_PREFIX = "Bearer ";
 const DPOP_AUTHORIZATION_PREFIX = "DPoP ";
 const WEBSOCKET_TICKET_QUERY_PARAM = "wsTicket";
 
@@ -638,10 +637,13 @@ const mapSessionVerificationErrors = <A, R>(
 
 function parseBearerToken(request: HttpServerRequest.HttpServerRequest): string | null {
   const header = request.headers["authorization"];
-  if (typeof header !== "string" || !header.startsWith(AUTHORIZATION_PREFIX)) {
+  if (typeof header !== "string") return null;
+  // RFC 9110 §11.1: the auth-scheme is case-insensitive, so "bearer" must parse like "Bearer".
+  const spaceAt = header.indexOf(" ");
+  if (spaceAt <= 0 || header.slice(0, spaceAt).toLowerCase() !== "bearer") {
     return null;
   }
-  const token = header.slice(AUTHORIZATION_PREFIX.length).trim();
+  const token = header.slice(spaceAt + 1).trim();
   return token.length > 0 ? token : null;
 }
 
