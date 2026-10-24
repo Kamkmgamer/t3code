@@ -38,6 +38,7 @@ import {
   useEffectEvent,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 
@@ -45,6 +46,8 @@ import { observeIntersection } from "~/lib/observeIntersection";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useClientSettings, updateClientSettings } from "~/hooks/useSettings";
 import { useRenderedAppearance } from "~/hooks/useTheme";
+import { useDiffFileTreePanelSize } from "~/hooks/useDiffFileTreePanelSize";
+import { RESIZABLE_WIDTH_PROPERTY } from "~/hooks/useResizableWidth";
 import { areAllDiffFilesCollapsed } from "~/lib/diffCollapse";
 import { pullRequestFindingKey, type PullRequestFinding } from "./pullRequestDetail.logic";
 import {
@@ -79,6 +82,7 @@ import { DiffPanelLoadingState } from "../DiffPanelShell";
 import { useDiffWorkerPool } from "../DiffWorkerPoolProvider";
 import { DiffCommentAnnotation } from "../diffs/DiffCommentAnnotation";
 import { DiffFileTree } from "../diffs/DiffFileTree";
+import { RightPanelResizeHandle } from "../preview/RightPanelResizeHandle";
 import { useCodeViewFileReveal } from "../diffs/useCodeViewFileReveal";
 import { diffFileTreeEntries } from "../diffs/diffFileTree.logic";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
@@ -299,6 +303,8 @@ function PullRequestCodeTab({
     false,
     Schema.Boolean,
   );
+  const [fileTreeRow, setFileTreeRow] = useState<HTMLDivElement | null>(null);
+  const filesPanel = useDiffFileTreePanelSize(fileTreeRow);
   const [selectedLines, setSelectedLines] = useState<{
     id: string;
     range: SelectedLineRange;
@@ -1402,7 +1408,7 @@ function PullRequestCodeTab({
           </Collapsible>
         </div>
       ) : null}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div ref={setFileTreeRow} className="flex min-h-0 flex-1 overflow-hidden">
         <div
           className="relative min-h-0 min-w-0 flex-1"
           // Headers live in shadow DOM; composedPath crosses that boundary.
@@ -1451,7 +1457,16 @@ function PullRequestCodeTab({
           </FileViewedToggleContext>
         </div>
         {fileTreeOpen ? (
-          <aside className="flex w-[min(20rem,40%)] min-w-48 shrink-0 border-l border-border/60">
+          <aside
+            className="relative flex shrink-0 border-l border-border/60"
+            style={
+              {
+                [RESIZABLE_WIDTH_PROPERTY]: `${filesPanel.width}px`,
+                width: `var(${RESIZABLE_WIDTH_PROPERTY})`,
+              } as CSSProperties
+            }
+          >
+            <RightPanelResizeHandle handlers={filesPanel.handlers} />
             <DiffFileTree
               ariaLabel={`${capitalizeTerm(term)} #${detail.number} files`}
               entries={fileTreeEntries}

@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown } from "lucide";
 import * as Schema from "effect/Schema";
-import { useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { useCodeViewFileReveal } from "./diffs/useCodeViewFileReveal";
 import { useFilesystemReadAccess } from "~/state/filesystem";
 import { useOpenInPreferredEditor } from "../editorPreferences";
@@ -37,6 +37,8 @@ import {
 import { useLocalStorage } from "../hooks/useLocalStorage";
 import { useRenderedAppearance } from "../hooks/useTheme";
 import { useStableCallback } from "../hooks/useStableCallback";
+import { useDiffFileTreePanelSize } from "../hooks/useDiffFileTreePanelSize";
+import { RESIZABLE_WIDTH_PROPERTY } from "../hooks/useResizableWidth";
 import {
   buildFileDiffContentVersion,
   buildFileDiffIdentityKey,
@@ -57,6 +59,7 @@ import { DiffStatLabel } from "./chat/DiffStatLabel";
 import { AnnotatableCodeView } from "./diffs/AnnotatableCodeView";
 import { DiffFileTree } from "./diffs/DiffFileTree";
 import { diffFileTreeEntries } from "./diffs/diffFileTree.logic";
+import { RightPanelResizeHandle } from "./preview/RightPanelResizeHandle";
 import { Button } from "./ui/button";
 import { MorphIcon } from "~/components/MorphIcon";
 import { ToggleGroup, Toggle } from "./ui/toggle-group";
@@ -211,6 +214,8 @@ export default function DiffPanel({
     false,
     Schema.Boolean,
   );
+  const [fileTreeRow, setFileTreeRow] = useState<HTMLDivElement | null>(null);
+  const filesPanel = useDiffFileTreePanelSize(fileTreeRow);
   const [baseRefQuery, setBaseRefQuery] = useState("");
   const [codeViewRevision, setCodeViewRevision] = useState(0);
 
@@ -1021,7 +1026,7 @@ export default function DiffPanel({
                 </div>
               )
             ) : lazySource || renderablePatch?.kind === "files" ? (
-              <div className="flex min-h-0 flex-1 overflow-hidden">
+              <div ref={setFileTreeRow} className="flex min-h-0 flex-1 overflow-hidden">
                 <div
                   className="min-h-0 min-w-0 flex-1"
                   onClickCapture={(event) => {
@@ -1139,7 +1144,16 @@ export default function DiffPanel({
                   />
                 </div>
                 {fileTreeOpen ? (
-                  <aside className="flex w-[min(16rem,40%)] min-w-40 shrink-0 border-l border-border/60">
+                  <aside
+                    className="relative flex shrink-0 border-l border-border/60"
+                    style={
+                      {
+                        [RESIZABLE_WIDTH_PROPERTY]: `${filesPanel.width}px`,
+                        width: `var(${RESIZABLE_WIDTH_PROPERTY})`,
+                      } as CSSProperties
+                    }
+                  >
+                    <RightPanelResizeHandle handlers={filesPanel.handlers} />
                     <DiffFileTree
                       ariaLabel={`${reviewSectionTitle} files`}
                       entries={fileTreeEntries}
