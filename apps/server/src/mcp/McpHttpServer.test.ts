@@ -758,7 +758,10 @@ it.effect("admits provider and OAuth client credentials and points only clients 
           Layer.succeed(McpHttpServer.McpClientAuthenticator, {
             authenticate: (request) =>
               Effect.succeed(
-                request.headers.authorization === `Bearer ${clientToken}` ? clientScope : undefined,
+                request.headers.authorization === `Bearer ${clientToken}` ||
+                  request.headers.authorization === `bearer ${clientToken}`
+                  ? clientScope
+                  : undefined,
               ),
           }),
         ),
@@ -798,10 +801,12 @@ it.effect("admits provider and OAuth client credentials and points only clients 
       expect((yield* call(clientToken)).status).toBe(200);
       // RFC 9110 §11.1: the auth-scheme is case-insensitive, so "bearer" authenticates too.
       expect((yield* call(providerToken, "bearer")).status).toBe(200);
+      expect((yield* call(clientToken, "bearer")).status).toBe(200);
       expect(seen.map((scope) => scope.requestNamespace)).toEqual([
         "provider-session",
         "client:session-1",
         "provider-session",
+        "client:session-1",
       ]);
 
       const missing = yield* call(undefined);
