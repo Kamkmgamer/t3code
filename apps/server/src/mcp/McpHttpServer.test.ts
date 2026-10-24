@@ -13,6 +13,7 @@ import {
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
@@ -689,8 +690,15 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("admits provider and OAuth client credentials and points only clients at OAuth", () =>
-  Effect.scoped(
+it.effect("admits provider and OAuth client credentials and points only clients at OAuth", () => {
+  const rejectionReasons: Array<string> = [];
+  const captureRejections = Logger.make((options) => {
+    if (options.logLevel === "Warn") {
+      const parts = options.message as ReadonlyArray<unknown>;
+      rejectionReasons.push((parts[1] as { readonly reason: string }).reason);
+    }
+  });
+  return Effect.scoped(
     Effect.gen(function* () {
       const providerToken = "providerTokenWithoutDots";
       const clientToken = "client-payload.client-signature";
@@ -750,7 +758,10 @@ it.effect("admits provider and OAuth client credentials and points only clients 
           Layer.succeed(McpHttpServer.McpClientAuthenticator, {
             authenticate: (request) =>
               Effect.succeed(
-                request.headers.authorization === `Bearer ${clientToken}` ? clientScope : undefined,
+                request.headers.authorization === `Bearer ${clientToken}` ||
+                  request.headers.authorization === `bearer ${clientToken}`
+                  ? clientScope
+                  : undefined,
               ),
           }),
         ),
@@ -759,11 +770,11 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         Layer.build,
       );
       const httpClient = yield* HttpClient.HttpClient;
-      const call = (token: string | undefined) =>
+      const call = (token: string | undefined, scheme = "Bearer") =>
         Effect.gen(function* () {
           const headers = {
             accept: "application/json, text/event-stream",
-            ...(token === undefined ? {} : { authorization: `Bearer ${token}` }),
+            ...(token === undefined ? {} : { authorization: `${scheme} ${token}` }),
           };
           const initialize = yield* httpClient.post("/mcp", {
             headers,
@@ -788,7 +799,12 @@ it.effect("admits provider and OAuth client credentials and points only clients 
 
       expect((yield* call(providerToken)).status).toBe(200);
       expect((yield* call(clientToken)).status).toBe(200);
+      // RFC 9110 §11.1: the auth-scheme is case-insensitive, so "bearer" authenticates too.
+      expect((yield* call(providerToken, "bearer")).status).toBe(200);
+      expect((yield* call(clientToken, "bearer")).status).toBe(200);
       expect(seen.map((scope) => scope.requestNamespace)).toEqual([
+        "provider-session",
+        "client:session-1",
         "provider-session",
         "client:session-1",
       ]);
@@ -799,6 +815,13 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         /^Bearer resource_metadata="http:\/\/[^"]+\/\.well-known\/oauth-protected-resource\/mcp"$/,
       );
 
+      const missingBearer = yield* call("");
+      expect(missingBearer.status).toBe(401);
+
+      const wrongScheme = yield* call("credential", "Basic");
+      expect(wrongScheme.status).toBe(401);
+      expect(wrongScheme.headers["www-authenticate"]).toBe(missing.headers["www-authenticate"]);
+
       const expiredClient = yield* call("stale-payload.stale-signature");
       expect(expiredClient.headers["www-authenticate"]).toContain("resource_metadata=");
       expect(expiredClient.headers["www-authenticate"]).toContain('error="invalid_token"');
@@ -806,6 +829,16 @@ it.effect("admits provider and OAuth client credentials and points only clients 
       const deadProvider = yield* call("deadProviderToken");
       expect(deadProvider.status).toBe(401);
       expect(deadProvider.headers["www-authenticate"]).toBe('Bearer error="invalid_token"');
+
+      expect(rejectionReasons).toEqual([
+        "missing_authorization_header",
+        "missing_bearer_token",
+        "unsupported_authorization_scheme",
+        "unknown_or_expired_token",
+        "unknown_or_expired_token",
+      ]);
     }),
-  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
-);
+  ).pipe(
+    Effect.provide(Layer.mergeAll(Logger.layer([captureRejections]), NodeHttpServer.layerTest)),
+  );
+});

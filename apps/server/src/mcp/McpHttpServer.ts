@@ -153,29 +153,47 @@ const normalizeMcpHttpResponse = (
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
 
+/**
+ * Reads the Bearer credential from an Authorization header. RFC 9110 §11.1 makes the auth-scheme
+ * case-insensitive, so "bearer" must authenticate like "Bearer", and the reason records whether
+ * a rejected request sent no header, another scheme, or an empty token.
+ */
+const readBearerCredential = (
+  authorization: string | undefined,
+):
+  | { readonly reason: "missing_authorization_header"; readonly token: "" }
+  | { readonly reason: "unsupported_authorization_scheme"; readonly token: "" }
+  | { readonly reason: "missing_bearer_token"; readonly token: "" }
+  | { readonly reason: "unknown_or_expired_token"; readonly token: string } => {
+  if (authorization === undefined) return { reason: "missing_authorization_header", token: "" };
+  const spaceAt = authorization.indexOf(" ");
+  const scheme = (spaceAt === -1 ? authorization : authorization.slice(0, spaceAt)).toLowerCase();
+  if (scheme !== "bearer") return { reason: "unsupported_authorization_scheme", token: "" };
+  const token = spaceAt === -1 ? "" : authorization.slice(spaceAt + 1).trim();
+  return token.length > 0
+    ? { reason: "unknown_or_expired_token", token }
+    : { reason: "missing_bearer_token", token: "" };
+};
+
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
     const request = yield* HttpServerRequest.HttpServerRequest;
-    const authorization = request.headers.authorization;
-    const token =
-      authorization?.startsWith("Bearer ") === true
-        ? authorization.slice("Bearer ".length).trim()
-        : "";
+    const credential = readBearerCredential(request.headers.authorization);
     const invocation =
-      (yield* registry.resolve(token)) ??
-      (Option.isSome(clients) && token.length > 0
+      (yield* registry.resolve(credential.token)) ??
+      (Option.isSome(clients) && credential.token.length > 0
         ? yield* clients.value.authenticate(request)
         : undefined);
     if (!invocation) {
       yield* Effect.logWarning("rejected MCP request with an unusable credential", {
-        reason: token.length === 0 ? "missing_bearer_token" : "unknown_or_expired_token",
+        reason: credential.reason,
       });
       return unauthorized({
         request,
-        presentedToken: token.length > 0,
-        offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(token),
+        presentedToken: credential.token.length > 0,
+        offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(credential.token),
       });
     }
     return yield* httpEffect.pipe(
