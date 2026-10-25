@@ -35,7 +35,10 @@ export function useDiffFileTreePanelSize(row: HTMLDivElement | null): DiffFileTr
 }
 
 function useRowClampedMaxWidth(row: HTMLDivElement | null): number {
-  const [maxWidth, setMaxWidth] = useState(FILE_TREE_MIN_WIDTH);
+  // Until the callback ref runs there is no row to measure. Leave the cap open
+  // so useResizableWidth can load the persisted width; the layout effect below
+  // measures and clamps it before the browser paints the row.
+  const [maxWidth, setMaxWidth] = useState(Number.POSITIVE_INFINITY);
   useLayoutEffect(() => {
     if (row === null) return;
     // Measure before first paint: the persisted width must be clamped against
