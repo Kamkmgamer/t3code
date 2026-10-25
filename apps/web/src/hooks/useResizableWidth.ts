@@ -1,5 +1,10 @@
 import * as Schema from "effect/Schema";
-import { type PointerEvent as ReactPointerEvent, useLayoutEffect, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useLayoutEffect,
+  useState,
+} from "react";
 
 import { getLocalStorageItem, setLocalStorageItem } from "./useLocalStorage";
 import { useResizeDrag } from "./useResizeDrag";
@@ -19,6 +24,7 @@ export interface UseResizableWidthOptions {
 
 export interface ResizableWidthHandlers {
   readonly ref: (node: HTMLElement | null) => (() => void) | undefined;
+  readonly onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => void;
   readonly onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void;
   readonly onPointerMove: (event: ReactPointerEvent<HTMLElement>) => void;
   readonly onPointerUp: (event: ReactPointerEvent<HTMLElement>) => void;
@@ -29,6 +35,8 @@ export interface ResizableWidthHandlers {
 /** Persist on drag end to avoid a storage write on every animation frame. */
 export function useResizableWidth(options: UseResizableWidthOptions): {
   readonly width: number;
+  readonly minWidth: number;
+  readonly maxWidth: number;
   readonly handlers: ResizableWidthHandlers;
 } {
   const { storageKey, defaultWidth, minWidth, maxWidth, edge } = options;
@@ -91,10 +99,43 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
   const { refresh } = drag;
   useLayoutEffect(() => refresh({ min: minWidth, max: maxWidth }), [refresh, minWidth, maxWidth]);
 
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
+
+    let nextWidth: number | undefined;
+    if (event.key === "Home") {
+      nextWidth = minWidth;
+    } else if (event.key === "End" && Number.isFinite(maxWidth)) {
+      nextWidth = maxWidth;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const step = event.shiftKey ? 64 : 16;
+      const direction =
+        event.key === "ArrowLeft" ? (edge === "left" ? 1 : -1) : edge === "left" ? -1 : 1;
+      nextWidth = clamp(clampedWidth + direction * step);
+    }
+    if (nextWidth === undefined) return;
+
+    event.preventDefault();
+    if (nextWidth === clampedWidth) return;
+    event.currentTarget.parentElement?.style.setProperty(
+      RESIZABLE_WIDTH_PROPERTY,
+      `${nextWidth}px`,
+    );
+    setWidthState({ storageKey, width: nextWidth });
+    try {
+      setLocalStorageItem(storageKey, nextWidth, WidthSchema);
+    } catch (error) {
+      console.error("Could not persist panel width.", error);
+    }
+  };
+
   return {
     width: clampedWidth,
+    minWidth,
+    maxWidth,
     handlers: {
       ref: drag.ref,
+      onKeyDown,
       onPointerDown: drag.onPointerDown,
       onPointerMove: drag.onPointerMove,
       onPointerUp: drag.onPointerUp,
