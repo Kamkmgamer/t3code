@@ -1147,15 +1147,20 @@ export default function DiffPanel({
                 </div>
                 {fileTreeOpen ? (
                   <aside
-                    className="relative flex shrink-0 border-l border-border/60"
+                    className="relative flex w-(--resizable-width) shrink-0 border-l border-border/60"
                     style={
                       {
                         [RESIZABLE_WIDTH_PROPERTY]: `${filesPanel.width}px`,
-                        width: `var(${RESIZABLE_WIDTH_PROPERTY})`,
                       } as CSSProperties
                     }
                   >
-                    <RightPanelResizeHandle handlers={filesPanel.handlers} />
+                    <RightPanelResizeHandle
+                      ariaLabel="Resize Files panel"
+                      handlers={filesPanel.handlers}
+                      width={filesPanel.width}
+                      minWidth={filesPanel.minWidth}
+                      maxWidth={filesPanel.maxWidth}
+                    />
                     <DiffFileTree
                       ariaLabel={`${reviewSectionTitle} files`}
                       entries={fileTreeEntries}

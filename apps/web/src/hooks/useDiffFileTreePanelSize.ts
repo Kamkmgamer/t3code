@@ -15,6 +15,8 @@ const CODE_VIEW_MIN_WIDTH = 360;
 
 export interface DiffFileTreePanelSize {
   readonly width: number;
+  readonly minWidth: number;
+  readonly maxWidth: number;
   readonly handlers: ResizableWidthHandlers;
 }
 
