@@ -30,7 +30,7 @@ export function useDiffFileTreePanelSize(row: HTMLDivElement | null): DiffFileTr
   return useResizableWidth({
     storageKey: FILE_TREE_WIDTH_STORAGE_KEY,
     defaultWidth: FILE_TREE_DEFAULT_WIDTH,
-    minWidth: FILE_TREE_MIN_WIDTH,
+    minWidth: Math.min(FILE_TREE_MIN_WIDTH, maxWidth),
     maxWidth,
     edge: "left",
   });
@@ -47,7 +47,7 @@ function useRowClampedMaxWidth(row: HTMLDivElement | null): number {
     // the row on the initial render, not one observer tick later (the tree
     // would flash over-wide on every mount).
     const measure = () => {
-      setMaxWidth(Math.max(FILE_TREE_MIN_WIDTH, Math.floor(row.clientWidth) - CODE_VIEW_MIN_WIDTH));
+      setMaxWidth(Math.max(0, Math.floor(row.clientWidth) - CODE_VIEW_MIN_WIDTH));
     };
     measure();
     return observeResize(row, () => measure());
