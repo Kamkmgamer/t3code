@@ -79,7 +79,8 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         host?.style.setProperty(RESIZABLE_WIDTH_PROPERTY, `${nextWidth}px`);
         return nextWidth;
       },
-      finish(finalWidth) {
+      finish(finalWidth, moved) {
+        if (!moved) return;
         setWidthState({ storageKey: startStorageKey, width: finalWidth });
         try {
           setLocalStorageItem(startStorageKey, finalWidth, WidthSchema);
