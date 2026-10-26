@@ -62,7 +62,7 @@ function PreviewPanelShellFrame(
   const localHostRef = useRef<HTMLDivElement | null>(null);
   const hostRef = props.hostRef ?? localHostRef;
   const returnedFocus = useRef(false);
-  const { width, handlers } = props.inlineSize;
+  const { width, minWidth, maxWidth, handlers } = props.inlineSize;
   // Suppress transitions before commit so resize/maximize changes never start width transitions.
   const [layoutTransition, setLayoutTransition] = useState(() => ({
     open,
@@ -159,7 +159,15 @@ function PreviewPanelShellFrame(
       data-preview-panel-mode={props.mode}
       data-preview-panel-maximized={maximized ? "true" : "false"}
     >
-      {isInline && !maximized ? <RightPanelResizeHandle handlers={handlers} /> : null}
+      {isInline && !maximized ? (
+        <RightPanelResizeHandle
+          ariaLabel="Resize preview panel"
+          handlers={handlers}
+          width={width}
+          minWidth={minWidth}
+          maxWidth={maxWidth}
+        />
+      ) : null}
       <div className={cn("h-full min-h-0 w-full", collapsible && "overflow-clip")}>
         <div
           className="flex h-full min-h-0 min-w-0 flex-col"

@@ -11,6 +11,9 @@ export const PIERRE_TREE_UNSAFE_CSS = `
   }
   [data-truncate-content='visible'] { overflow: hidden; text-overflow: ellipsis; }
   [data-truncate-marker] { display: none; }
+  /* Keep the filename segment readable when Pierre's extension split overflows. */
+  [data-item-section='content'] [data-truncate-group-container='middle'] > div[data-truncate-segment-priority='1'] { flex: 0 999999 max-content; }
+  [data-item-section='content'] [data-truncate-group-container='middle'] > div[data-truncate-segment-priority='2'] { flex: 0 1 max-content; }
   button[data-type='item'], button[data-type='item']::before { border-radius: var(--radius-md); }
   svg[data-icon-name='t3-tree-icon-loading'] { opacity: 0.6; }
   @media (prefers-reduced-motion: no-preference) {

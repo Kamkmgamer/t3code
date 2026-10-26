@@ -1,5 +1,11 @@
 import * as Schema from "effect/Schema";
-import { type PointerEvent as ReactPointerEvent, useLayoutEffect, useRef, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { getLocalStorageItem, setLocalStorageItem } from "./useLocalStorage";
 import { useResizeDrag } from "./useResizeDrag";
@@ -18,6 +24,7 @@ export interface UseResizableWidthOptions {
 }
 
 export interface ResizableWidthHandlers {
+  readonly onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => void;
   readonly onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void;
   readonly onPointerMove: (event: ReactPointerEvent<HTMLElement>) => void;
   readonly onPointerUp: (event: ReactPointerEvent<HTMLElement>) => void;
@@ -25,9 +32,14 @@ export interface ResizableWidthHandlers {
   readonly onLostPointerCapture: (event: ReactPointerEvent<HTMLElement>) => void;
 }
 
+const KEYBOARD_RESIZE_STEP = 16;
+const KEYBOARD_RESIZE_LARGE_STEP = 64;
+
 /** Persist on drag end to avoid a storage write on every animation frame. */
 export function useResizableWidth(options: UseResizableWidthOptions): {
   readonly width: number;
+  readonly minWidth: number;
+  readonly maxWidth: number;
   readonly handlers: ResizableWidthHandlers;
 } {
   const { storageKey, defaultWidth, minWidth, maxWidth, edge } = options;
@@ -70,7 +82,8 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         host?.style.setProperty(RESIZABLE_WIDTH_PROPERTY, `${nextWidth}px`);
         return nextWidth;
       },
-      finish(finalWidth) {
+      finish(finalWidth, moved) {
+        if (!moved) return;
         setWidthState({ storageKey, width: finalWidth });
         try {
           setLocalStorageItem(latestOptions.current.storageKey, finalWidth, WidthSchema);
@@ -90,5 +103,35 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
   // Mid-drag bound changes rewrite committed width; restore the live pointer position.
   useLayoutEffect(refresh, [clamp, clampedWidth, refresh]);
 
-  return { width: clampedWidth, handlers };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.nativeEvent.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
+
+    let nextWidth: number | undefined;
+    if (event.key === "Home") {
+      nextWidth = minWidth;
+    } else if (event.key === "End" && Number.isFinite(maxWidth)) {
+      nextWidth = maxWidth;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const step = event.shiftKey ? KEYBOARD_RESIZE_LARGE_STEP : KEYBOARD_RESIZE_STEP;
+      const direction =
+        event.key === "ArrowLeft" ? (edge === "left" ? 1 : -1) : edge === "left" ? -1 : 1;
+      nextWidth = clamp(clampedWidth + direction * step);
+    }
+    if (nextWidth === undefined) return;
+
+    event.preventDefault();
+    if (nextWidth === clampedWidth) return;
+    event.currentTarget.parentElement?.style.setProperty(
+      RESIZABLE_WIDTH_PROPERTY,
+      `${nextWidth}px`,
+    );
+    setWidthState({ storageKey, width: nextWidth });
+    try {
+      setLocalStorageItem(storageKey, nextWidth, WidthSchema);
+    } catch (error) {
+      console.error("Could not persist panel width.", error);
+    }
+  };
+
+  return { width: clampedWidth, minWidth, maxWidth, handlers: { ...handlers, onKeyDown } };
 }

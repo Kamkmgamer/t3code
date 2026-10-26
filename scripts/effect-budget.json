@@ -408,6 +408,7 @@
   "apps/web/src/hooks/FileMetadataThreadProvider.tsx": 1,
   "apps/web/src/hooks/useCopyToClipboard.ts": 1,
   "apps/web/src/hooks/useDefaultTheme.ts": 1,
+  "apps/web/src/hooks/useDiffFileTreePanelSize.ts": 1,
   "apps/web/src/hooks/useDelayedStatus.ts": 2,
   "apps/web/src/hooks/useEnvironmentDisconnectDelay.ts": 1,
   "apps/web/src/hooks/useEnvironmentTheme.ts": 1,

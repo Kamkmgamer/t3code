@@ -5,6 +5,8 @@ import { observeResize } from "../lib/observeResize";
 
 export interface PreviewPanelInlineSize {
   readonly width: number;
+  readonly minWidth: number;
+  readonly maxWidth: number;
   readonly handlers: ResizableWidthHandlers;
 }
 
