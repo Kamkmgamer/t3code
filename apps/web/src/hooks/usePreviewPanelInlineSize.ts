@@ -32,7 +32,12 @@ export function usePreviewPanelInlineSize(
   const [maxWidth, setMaxWidth] = useState(() =>
     getPreviewPanelMaxWidth(typeof window === "undefined" ? 1280 : window.innerWidth),
   );
-  const { width, minWidth, maxWidth: resolvedMaxWidth, handlers } = useResizableWidth({
+  const {
+    width,
+    minWidth,
+    maxWidth: resolvedMaxWidth,
+    handlers,
+  } = useResizableWidth({
     storageKey: options.widthStorageKey ?? PREVIEW_PANEL_WIDTH_STORAGE_KEY,
     defaultWidth: options.defaultWidth ?? PREVIEW_PANEL_DEFAULT_WIDTH,
     minWidth: PREVIEW_PANEL_MIN_WIDTH,
