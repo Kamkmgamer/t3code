@@ -48,6 +48,8 @@ export interface ResolvedPeerLink {
   /** The first address that answered as this peer. */
   readonly url: string;
   readonly token: string;
+  /** Identifies the credential generation used for this call. */
+  readonly secretName: string;
 }
 
 export const LINKED_ENVIRONMENTS_OFF =
@@ -88,6 +90,7 @@ export class PeerLinks extends Context.Service<
     /** Records the outcome of a call, so listing shows whether the peer answered last time. */
     readonly recordOutcome: (
       environmentId: EnvironmentId,
+      secretName: string,
       outcome: { readonly error: string | null; readonly revoked?: boolean },
     ) => Effect.Effect<void>;
   }
@@ -204,8 +207,8 @@ const make = Effect.gen(function* () {
       urls: yield* decodeUrls(row.urls_json),
       access: yield* decodeAccess(row.access),
       linkedAt: DateTime.makeUnsafe(row.linked_at),
-      // Its token predates link fencing, so the peer would not fence its work:
-      // like an expired link, only a new pairing code brings it back.
+      // A token predating link fencing cannot safely carry linked work, so its
+      // link is treated as already expired until it is paired again.
       expiresAt: DateTime.makeUnsafe(row.fenced === 1 ? row.expires_at : row.linked_at),
       lastReachedAt: row.last_reached_at === null ? null : DateTime.makeUnsafe(row.last_reached_at),
       lastError: row.last_error,
@@ -585,31 +588,40 @@ const make = Effect.gen(function* () {
           message: `${link.label} did not answer at ${link.urls.join(", ")}.`,
         });
       }
-      // A link made before the peer had to fence linked work, or a peer moved
-      // back to such a version, would carry work past those limits.
+      // A link made before the peer fenced linked work, or a peer moved back
+      // to such a version, would carry work past those limits.
       if (!fenced) {
         return yield* new PeerLinkError({
           reason: "incompatible",
           message: `${link.label} runs a T3 Code version that cannot keep a linked agent's limits. Update it, then link again.`,
         });
       }
-      return { link, url: url.value, token: new TextDecoder().decode(stored.value) };
+      return {
+        link,
+        url: url.value,
+        token: new TextDecoder().decode(stored.value),
+        secretName: row.value.secret_name,
+      };
     },
   );
 
-  const recordOutcome: PeerLinks["Service"]["recordOutcome"] = (environmentId, outcome) =>
+  const recordOutcome: PeerLinks["Service"]["recordOutcome"] = (
+    environmentId,
+    secretName,
+    outcome,
+  ) =>
     DateTime.now.pipe(
       Effect.flatMap((now) =>
         outcome.error === null
           ? sql`
               UPDATE peer_environment_links
               SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL, revoked = 0
-              WHERE environment_id = ${environmentId}
+              WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
             `
           : sql`
               UPDATE peer_environment_links
               SET last_error = ${outcome.error}${outcome.revoked === true ? sql`, revoked = 1` : sql``}
-              WHERE environment_id = ${environmentId}
+              WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
             `,
       ),
       Effect.asVoid,

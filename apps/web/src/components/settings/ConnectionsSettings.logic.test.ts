@@ -2,6 +2,8 @@ import type { DesktopWslState } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   applyWslEnableSelection,
+  canRevokeOtherClients,
+  hasLinkedClientSessions,
   selectQrEndpointOption,
   togglePairingScopeSelection,
 } from "./ConnectionsSettings.logic";
@@ -38,6 +40,20 @@ describe("togglePairingScopeSelection", () => {
     },
   ] as const)("$label", ({ current, scope, checked, expected }) => {
     expect(togglePairingScopeSelection(current, scope, checked)).toEqual(expected);
+  });
+});
+
+describe("authorized client revocation", () => {
+  it("only offers bulk revoke after sessions are readable", () => {
+    expect(canRevokeOtherClients(null)).toBe(false);
+    expect(canRevokeOtherClients([{ current: true }])).toBe(false);
+    expect(canRevokeOtherClients([{ current: true }, { current: false }])).toBe(true);
+  });
+
+  it("detects linked sessions that need explicit confirmation", () => {
+    expect(hasLinkedClientSessions([{ current: true, peerLink: true }])).toBe(false);
+    expect(hasLinkedClientSessions([{ current: false, peerLink: false }])).toBe(false);
+    expect(hasLinkedClientSessions([{ current: false, peerLink: true }])).toBe(true);
   });
 });
 

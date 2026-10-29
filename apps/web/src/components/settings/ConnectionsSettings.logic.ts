@@ -47,7 +47,13 @@ export function togglePairingScopeSelection(
 export function canRevokeOtherClients(
   clientSessions: ReadonlyArray<{ readonly current: boolean }> | null,
 ): boolean {
-  return clientSessions === null || clientSessions.some((session) => !session.current);
+  return clientSessions !== null && clientSessions.some((session) => !session.current);
+}
+
+export function hasLinkedClientSessions(
+  clientSessions: ReadonlyArray<{ readonly current: boolean; readonly peerLink?: boolean }> | null,
+): boolean {
+  return clientSessions?.some((session) => !session.current && session.peerLink === true) ?? false;
 }
 
 type WslEnableBridge = Pick<DesktopBridge, "setWslBackendEnabled" | "setWslDistro" | "setWslOnly">;

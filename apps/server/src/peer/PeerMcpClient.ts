@@ -64,6 +64,16 @@ const decodeFailure = Schema.decodeUnknownOption(
   ),
 );
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
+const LINK_REVOKED_MESSAGE =
+  "The linked environment no longer accepts this link. It may have been revoked there; link it again.";
+
+const revokedLinkFailure = () =>
+  new OrchestratorMcpFailure({ code: "capability_denied", message: LINK_REVOKED_MESSAGE });
+
+const isRevokedLinkFailure = (error: unknown): error is OrchestratorMcpFailure =>
+  isOrchestratorMcpFailure(error) &&
+  error.code === "capability_denied" &&
+  error.message === LINK_REVOKED_MESSAGE;
 
 /** A peer link problem, as the agent that asked hears it. */
 const fromLinkError = (error: PeerLinkError) =>
@@ -142,7 +152,7 @@ const make = Effect.gen(function* () {
         code: initialized.status === 401 ? "capability_denied" : "orchestration_error",
         message:
           initialized.status === 401
-            ? "The linked environment no longer accepts this link. It may have been revoked there; link it again."
+            ? LINK_REVOKED_MESSAGE
             : `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
       });
     }
@@ -155,104 +165,100 @@ const make = Effect.gen(function* () {
     return sessionId;
   });
 
-  const call: PeerMcpClient["Service"]["call"] = Effect.fn("PeerMcpClient.call")(
-    function* (input) {
-      const resolved = yield* links
-        .resolve(input.environmentId)
-        .pipe(Effect.mapError(fromLinkError));
-      const limitHeader = {
-        [McpInvocationContext.MODE_LIMIT_HEADER]: `${input.limits.runtimeMode}/${input.limits.interactionMode}`,
-      };
-      const sessionKey = `${input.environmentId} ${resolved.url}`;
-      const callOnce = (sessionId: string) =>
-        post(
-          resolved.url,
-          resolved.token,
-          {
-            jsonrpc: "2.0",
-            id: 1,
-            method: "tools/call",
-            params: { name: input.tool, arguments: input.arguments },
-          },
-          { ...limitHeader, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION },
+  const call: PeerMcpClient["Service"]["call"] = Effect.fn("PeerMcpClient.call")(function* (input) {
+    const resolved = yield* links.resolve(input.environmentId).pipe(Effect.mapError(fromLinkError));
+    const limitHeader = {
+      [McpInvocationContext.MODE_LIMIT_HEADER]: `${input.limits.runtimeMode}/${input.limits.interactionMode}`,
+    };
+    const sessionKey = `${input.environmentId} ${resolved.url} ${resolved.secretName}`;
+    const callOnce = (sessionId: string) =>
+      post(
+        resolved.url,
+        resolved.token,
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: input.tool, arguments: input.arguments },
+        },
+        { ...limitHeader, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION },
+      );
+    return yield* Effect.gen(function* () {
+      const callEffect = Effect.gen(function* () {
+        const existing = (yield* Ref.get(sessions)).get(sessionKey);
+        const sessionId =
+          existing ?? (yield* openSession(resolved.url, resolved.token, limitHeader));
+        let response = yield* callOnce(sessionId);
+        if (response.status === 404) {
+          const renewed = yield* openSession(resolved.url, resolved.token, limitHeader);
+          yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
+          response = yield* callOnce(renewed);
+        } else if (existing === undefined) {
+          yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, sessionId));
+        }
+        if (response.status === 401) {
+          return yield* revokedLinkFailure();
+        }
+        if (response.status === 403) return yield* linkedEnvironmentsOffThere;
+        if (response.status !== 200) {
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: `The linked environment answered HTTP ${response.status}.`,
+          });
+        }
+        const body = yield* decodeToolCallResponse(
+          responseJson(response.headers["content-type"], yield* response.text),
+        ).pipe(
+          Effect.mapError(
+            () =>
+              new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message: "The linked environment answered in an unexpected shape.",
+              }),
+          ),
         );
-      const existing = (yield* Ref.get(sessions)).get(sessionKey);
-      const sessionId = existing ?? (yield* openSession(resolved.url, resolved.token, limitHeader));
-      let response = yield* callOnce(sessionId);
-      if (response.status === 404) {
-        const renewed = yield* openSession(resolved.url, resolved.token, limitHeader);
-        yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
-        response = yield* callOnce(renewed);
-      } else if (existing === undefined) {
-        yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, sessionId));
-      }
-      if (response.status === 401) {
-        return yield* new OrchestratorMcpFailure({
-          code: "capability_denied",
-          message:
-            "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
-        });
-      }
-      if (response.status === 403) return yield* linkedEnvironmentsOffThere;
-      if (response.status !== 200) {
-        return yield* new OrchestratorMcpFailure({
-          code: "orchestration_error",
-          message: `The linked environment answered HTTP ${response.status}.`,
-        });
-      }
-      const body = yield* decodeToolCallResponse(
-        responseJson(response.headers["content-type"], yield* response.text),
-      ).pipe(
-        Effect.mapError(
-          () =>
-            new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message: "The linked environment answered in an unexpected shape.",
-            }),
-        ),
-      );
-      if (body.error !== undefined || body.result === undefined) {
-        return yield* new OrchestratorMcpFailure({
-          code: "invalid_request",
-          message: body.error?.message ?? "The linked environment returned no result.",
-        });
-      }
-      const text = body.result.content.map((part) => part.text ?? "").join("");
-      if (body.result.isError === true) {
-        // A refusal keeps the peer's own code, so the agent sees why it was refused.
-        const refused = decodeFailure(text);
-        return yield* refused._tag === "Some"
-          ? new OrchestratorMcpFailure({ code: refused.value.code, message: refused.value.message })
-          : new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message: text || "The linked environment refused the call.",
-            });
-      }
-      const success = Schema.fromJsonString(input.success);
-      return yield* Schema.decodeEffect(success)(text).pipe(
-        Effect.mapError(
-          () =>
-            new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message:
-                "The linked environment's answer did not match this version. Update both environments.",
-            }),
-        ),
-      );
-    },
-    (effect, input) =>
-      effect.pipe(
+        if (body.error !== undefined || body.result === undefined) {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: body.error?.message ?? "The linked environment returned no result.",
+          });
+        }
+        const text = body.result.content.map((part) => part.text ?? "").join("");
+        if (body.result.isError === true) {
+          // A refusal keeps the peer's own code, so the agent sees why it was refused.
+          const refused = decodeFailure(text);
+          return yield* refused._tag === "Some"
+            ? new OrchestratorMcpFailure({
+                code: refused.value.code,
+                message: refused.value.message,
+              })
+            : new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message: text || "The linked environment refused the call.",
+              });
+        }
+        const success = Schema.fromJsonString(input.success);
+        return yield* Schema.decodeEffect(success)(text).pipe(
+          Effect.mapError(
+            () =>
+              new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message:
+                  "The linked environment's answer did not match this version. Update both environments.",
+              }),
+          ),
+        );
+      });
+      return yield* callEffect.pipe(
         Effect.tapError((error) =>
-          links.recordOutcome(input.environmentId, {
+          links.recordOutcome(input.environmentId, resolved.secretName, {
             error: error.message,
-            ...(isOrchestratorMcpFailure(error) &&
-            error.code === "capability_denied" &&
-            error.message.includes("revoked")
-              ? { revoked: true }
-              : {}),
+            ...(isRevokedLinkFailure(error) ? { revoked: true } : {}),
           }),
         ),
-        Effect.tap(() => links.recordOutcome(input.environmentId, { error: null })),
+        Effect.tap(() =>
+          links.recordOutcome(input.environmentId, resolved.secretName, { error: null }),
+        ),
         // Recorded above with the transport's own message; the agent hears it plainly.
         Effect.catchTags({
           HttpClientError: () =>
@@ -263,8 +269,9 @@ const make = Effect.gen(function* () {
               }),
             ),
         }),
-      ),
-  );
+      );
+    });
+  });
 
   return PeerMcpClient.of({ call });
 });

@@ -22,6 +22,7 @@ import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestam
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
 import {
   canRevokeOtherClients,
+  hasLinkedClientSessions,
   isQrShareableEndpoint,
   selectQrEndpointOption,
   togglePairingScopeSelection,
@@ -601,6 +602,17 @@ export const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHead
   ]);
   const selectedScopes = pairingScopes.filter((scope) => delegatableScopes.includes(scope));
   const [isCreatingPairingLink, setIsCreatingPairingLink] = useState(false);
+  const handleRevokeOtherClients = async () => {
+    if (clientSessions === null) return;
+    if (hasLinkedClientSessions(clientSessions)) {
+      const confirmed = await requestConfirmDialog(
+        "Revoke all other clients, including linked environments? Linked environments will need to be linked again.",
+        { variant: "destructive" },
+      );
+      if (confirmed !== true) return;
+    }
+    onRevokeOtherClients();
+  };
 
   const handleCreatePairingLink = async () => {
     if (
@@ -647,7 +659,7 @@ export const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHead
         size="xs"
         variant="destructive-outline"
         disabled={isRevokingOtherClients || !canRevokeOtherClients(clientSessions)}
-        onClick={() => void onRevokeOtherClients()}
+        onClick={() => void handleRevokeOtherClients()}
       >
         {isRevokingOtherClients ? "Revoking…" : "Revoke others"}
       </Button>

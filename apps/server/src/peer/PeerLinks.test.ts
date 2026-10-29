@@ -356,6 +356,35 @@ it.effect("reads one stored link without asking the peer", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("ignores an outcome from a link generation replaced while it was in flight", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const old = yield* a.links.resolve(box.environmentId);
+
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* a.links.recordOutcome(box.environmentId, old.secretName, {
+        error: "The old request arrived late.",
+        revoked: true,
+      });
+
+      const current = yield* a.links.get(box.environmentId);
+      expect(Option.map(current, (link) => link.lastError)).toEqual(Option.some(null));
+      expect(Option.map(current, (link) => link.revoked)).toEqual(Option.some(false));
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("tells the agent to link again once the peer revokes the link or it expires", () =>
   Effect.scoped(
     Effect.gen(function* () {
