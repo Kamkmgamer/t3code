@@ -61,6 +61,11 @@ export interface ProbeTracker {
   readonly reached: Deferred.Deferred<void>;
 }
 
+type McpResponseOverride = {
+  readonly status: number;
+  readonly sessionId?: string;
+};
+
 /**
  * The environment a link points at, as it runs: its descriptor, MCP OAuth,
  * and `/mcp` with `tools` behind the real client authenticator, on a real
@@ -77,6 +82,9 @@ export const servePeer = <E, R>(
     const bearers = yield* Ref.make<ReadonlyArray<string>>([]);
     const probes = yield* Ref.make(0);
     const requests = yield* Ref.make<ReadonlyArray<string>>([]);
+    const invalidSessionId = yield* Ref.make<string | null>(null);
+    const initializeResponse = yield* Ref.make<McpResponseOverride | null>(null);
+    const sessionResponse = yield* Ref.make<McpResponseOverride | null>(null);
     const mcpGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     const mcpStarted = yield* Deferred.make<void>();
     const mcpInitializeCount = yield* Ref.make(0);
@@ -115,7 +123,10 @@ export const servePeer = <E, R>(
             }
           }
           const authorization = request.headers.authorization;
-          yield* Ref.update(requests, (seen) => [...seen, `${request.method} ${request.url}`]);
+          yield* Ref.update(requests, (seen) => [
+            ...seen,
+            `${request.method} ${request.url} ${request.headers["mcp-session-id"] ?? ""}`,
+          ]);
           if (request.url.startsWith("/mcp") && request.method === "DELETE") {
             yield* Deferred.succeed(mcpDeleteStarted, undefined);
           }
@@ -124,6 +135,14 @@ export const servePeer = <E, R>(
           }
           if (request.url.startsWith("/mcp") && request.method === "POST") {
             const notification = request.headers["mcp-session-id"] !== undefined;
+            const override = yield* Ref.get(notification ? sessionResponse : initializeResponse);
+            if (override !== null) {
+              return HttpServerResponse.empty({
+                status: override.status,
+                headers:
+                  override.sessionId === undefined ? {} : { "mcp-session-id": override.sessionId },
+              });
+            }
             if (!notification) {
               const count = yield* Ref.updateAndGet(mcpInitializeCount, (value) => value + 1);
               if (count >= 2) yield* Deferred.succeed(mcpConcurrentStarted, undefined);
@@ -137,6 +156,9 @@ export const servePeer = <E, R>(
               yield* Deferred.await(gate);
             }
             if (notification) {
+              if ((yield* Ref.get(invalidSessionId)) === request.headers["mcp-session-id"]) {
+                return HttpServerResponse.empty({ status: 404 });
+              }
               const status = yield* Ref.get(mcpNotificationStatus);
               if (status !== null) return HttpServerResponse.empty({ status });
             }
@@ -191,6 +213,9 @@ export const servePeer = <E, R>(
       /** How often its descriptor was asked for, as a probe of whether it answers. */
       probes,
       requests,
+      invalidSessionId,
+      initializeResponse,
+      sessionResponse,
       mcpGate,
       mcpStarted,
       mcpInitializeCount,

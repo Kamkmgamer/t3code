@@ -17,6 +17,7 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
+import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as PeerLinks from "./PeerLinks.ts";
@@ -151,24 +152,36 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const drainResponse = (response: HttpClientResponse.HttpClientResponse) =>
+    response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore);
+  const readResponse = (response: HttpClientResponse.HttpClientResponse) =>
+    response.text.pipe(
+      Effect.timeout(Duration.seconds(3)),
+      Effect.mapError(
+        () =>
+          new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: "The linked environment stopped answering.",
+          }),
+      ),
+    );
+
   const closeSession = (session: Session) =>
-    Effect.uninterruptible(
-      peerHttpClient
-        .execute(
-          HttpClientRequest.make("DELETE")(`${session.url}/mcp`).pipe(
-            HttpClientRequest.setHeaders({
-              accept: "application/json, text/event-stream",
-              authorization: `Bearer ${session.token}`,
-              "mcp-session-id": session.sessionId,
-              "mcp-protocol-version": PROTOCOL_VERSION,
-            }),
-          ),
-        )
-        .pipe(
-          Effect.flatMap((response) => response.text),
-          Effect.timeout(Duration.seconds(3)),
-          Effect.ignore,
-        ),
+    Effect.uninterruptibleMask(() =>
+      Effect.interruptible(
+        peerHttpClient
+          .execute(
+            HttpClientRequest.make("DELETE")(`${session.url}/mcp`).pipe(
+              HttpClientRequest.setHeaders({
+                accept: "application/json, text/event-stream",
+                authorization: `Bearer ${session.token}`,
+                "mcp-session-id": session.sessionId,
+                "mcp-protocol-version": PROTOCOL_VERSION,
+              }),
+            ),
+          )
+          .pipe(Effect.flatMap((response) => response.text)),
+      ).pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
     );
 
   const clearSessions = Effect.fn("PeerMcpClient.clearSessions")(function* (
@@ -190,9 +203,7 @@ const make = Effect.gen(function* () {
         ),
       },
     ]);
-    yield* Effect.uninterruptible(
-      Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true }),
-    );
+    yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
   });
 
   yield* links.subscribeRefreshes.pipe(
@@ -206,61 +217,73 @@ const make = Effect.gen(function* () {
     token: string,
     limitHeader: Record<string, string>,
   ) {
-    const initialized = yield* post(
-      url,
-      token,
-      {
-        jsonrpc: "2.0",
-        id: 0,
-        method: "initialize",
-        params: {
-          protocolVersion: PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: { name: "t3code-peer", version: "1" },
-        },
-      },
-      limitHeader,
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const initialized = yield* restore(
+          post(
+            url,
+            token,
+            {
+              jsonrpc: "2.0",
+              id: 0,
+              method: "initialize",
+              params: {
+                protocolVersion: PROTOCOL_VERSION,
+                capabilities: {},
+                clientInfo: { name: "t3code-peer", version: "1" },
+              },
+            },
+            limitHeader,
+          ),
+        );
+        const sessionId = initialized.headers["mcp-session-id"];
+        if (initialized.status !== 200) {
+          yield* restore(drainResponse(initialized));
+          if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
+          if (initialized.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
+          });
+        }
+        if (sessionId === undefined) {
+          yield* restore(drainResponse(initialized));
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: "The linked environment did not return an MCP session.",
+          });
+        }
+        const session = { environmentId, url, token, sessionId };
+        return yield* Effect.gen(function* () {
+          yield* restore(readResponse(initialized).pipe(Effect.asVoid));
+          const notification = yield* restore(
+            post(
+              url,
+              token,
+              { jsonrpc: "2.0", method: "notifications/initialized" },
+              {
+                ...limitHeader,
+                "mcp-session-id": sessionId,
+                "mcp-protocol-version": PROTOCOL_VERSION,
+              },
+            ),
+          );
+          if (notification.status < 200 || notification.status >= 300) {
+            yield* restore(drainResponse(notification));
+            if (notification.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
+            if (notification.status === 403) return yield* linkedEnvironmentsOffThere;
+            return yield* new OrchestratorMcpFailure({
+              code: "orchestration_error",
+              message: `The linked environment refused to initialize the MCP session (HTTP ${notification.status}).`,
+            });
+          }
+          yield* restore(readResponse(notification).pipe(Effect.asVoid));
+          return session;
+        }).pipe(
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? closeSession(session) : Effect.void)),
+        );
+      }),
     );
-    const sessionId = initialized.headers["mcp-session-id"];
-    if (initialized.status === 403) {
-      yield* initialized.text;
-      return yield* linkedEnvironmentsOffThere;
-    }
-    if (initialized.status === 401) {
-      yield* initialized.text;
-      return yield* Effect.fail(new PeerMcpUnauthorized());
-    }
-    if (initialized.status !== 200 || sessionId === undefined) {
-      yield* initialized.text;
-      return yield* new OrchestratorMcpFailure({
-        code: "orchestration_error",
-        message: `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
-      });
-    }
-    const session = { environmentId, url, token, sessionId };
-    yield* Effect.gen(function* () {
-      yield* initialized.text;
-      const notification = yield* post(
-        url,
-        token,
-        { jsonrpc: "2.0", method: "notifications/initialized" },
-        {
-          ...limitHeader,
-          "mcp-session-id": sessionId,
-          "mcp-protocol-version": PROTOCOL_VERSION,
-        },
-      );
-      yield* notification.text;
-      if (notification.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
-      if (notification.status < 200 || notification.status >= 300) {
-        return yield* new OrchestratorMcpFailure({
-          code: "orchestration_error",
-          message: `The linked environment refused to initialize the MCP session (HTTP ${notification.status}).`,
-        });
-      }
-      return sessionId;
-    }).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? closeSession(session) : Effect.void)));
-    return session;
   });
 
   const openAndPublish = Effect.fn("PeerMcpClient.openAndPublish")(function* (
@@ -353,7 +376,15 @@ const make = Effect.gen(function* () {
         }
         let response = yield* callOnce(activeSessionId);
         if (response.status === 404) {
-          yield* response.text;
+          yield* drainResponse(response);
+          const failedSessionId = activeSessionId;
+          yield* Ref.update(sessionState, (current) => {
+            const retained = current.sessions.get(sessionKey);
+            if (retained?.sessionId !== failedSessionId) return current;
+            const sessions = new Map(current.sessions);
+            sessions.delete(sessionKey);
+            return { generations: current.generations, sessions };
+          });
           const renewed = yield* openAndPublish(
             input.environmentId,
             resolved.url,
@@ -367,9 +398,10 @@ const make = Effect.gen(function* () {
           response = yield* callOnce(activeSessionId);
         }
         if (response.status === 401) {
-          yield* response.text;
+          yield* drainResponse(response);
           const session = yield* Ref.modify(sessionState, (current) => {
             const session = current.sessions.get(sessionKey);
+            if (session?.sessionId !== activeSessionId) return [undefined, current];
             const next = new Map(current.sessions);
             next.delete(sessionKey);
             return [session, { generations: current.generations, sessions: next }];
@@ -378,11 +410,11 @@ const make = Effect.gen(function* () {
           return yield* Effect.fail(new PeerMcpUnauthorized());
         }
         if (response.status === 403) {
-          yield* response.text;
+          yield* drainResponse(response);
           return yield* linkedEnvironmentsOffThere;
         }
         if (response.status !== 200) {
-          yield* response.text;
+          yield* drainResponse(response);
           return yield* new OrchestratorMcpFailure({
             code: "orchestration_error",
             message: `The linked environment answered HTTP ${response.status}.`,

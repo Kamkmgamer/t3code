@@ -31,6 +31,7 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
+import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassification";
 
@@ -710,12 +711,8 @@ const make = Effect.gen(function* () {
   const probe: PeerLinks["Service"]["probe"] = Effect.fn("PeerLinks.probe")(
     function* (environmentId) {
       const resolved = yield* resolve(environmentId);
-      const executeDrained = (request: HttpClientRequest.HttpClientRequest) =>
-        peerHttpClient
-          .execute(request)
-          .pipe(Effect.flatMap((response) => response.text.pipe(Effect.as(response))));
       const request = (request: HttpClientRequest.HttpClientRequest) =>
-        executeDrained(request).pipe(
+        peerHttpClient.execute(request).pipe(
           Effect.timeout(probeTimeout(resolved.url)),
           Effect.mapError(
             (cause) =>
@@ -726,108 +723,141 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
-      const response = yield* request(
-        HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
-          HttpClientRequest.setHeaders({
+      const readResponse = (response: HttpClientResponse.HttpClientResponse) =>
+        response.text.pipe(
+          Effect.timeout(probeTimeout(resolved.url)),
+          Effect.mapError(
+            (cause) =>
+              new PeerLinkError({
+                reason: "unreachable",
+                message: `${resolved.link.label} stopped answering while checking its link.`,
+                cause,
+              }),
+          ),
+        );
+      const initRequest = HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+        HttpClientRequest.setHeaders({
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${resolved.token}`,
+          "mcp-protocol-version": "2025-06-18",
+        }),
+        HttpClientRequest.setBody(
+          HttpBody.jsonUnsafe({
+            jsonrpc: "2.0",
+            id: 0,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "t3code-peer-probe", version: "1" },
+            },
+          }),
+        ),
+      );
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const response = yield* restore(request(initRequest));
+          if (response.status === 401) {
+            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
+            yield* recordOutcome(environmentId, resolved.secretName, {
+              error: "The linked environment rejected this link (HTTP 401).",
+              revoked: true,
+            });
+            return yield* new PeerLinkError({
+              reason: "revoked",
+              message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+            });
+          }
+          if (response.status === 403) {
+            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
+            return yield* new PeerLinkError({
+              reason: "unreachable",
+              message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
+            });
+          }
+          if (response.status !== 200) {
+            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
+            return yield* new PeerLinkError({
+              reason: "unreachable",
+              message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
+            });
+          }
+          const sessionId = response.headers["mcp-session-id"];
+          if (sessionId === undefined) {
+            return yield* new PeerLinkError({
+              reason: "unreachable",
+              message: `${resolved.link.label} did not return an MCP session for the link check.`,
+            });
+          }
+          const sessionHeaders = {
             accept: "application/json, text/event-stream",
             authorization: `Bearer ${resolved.token}`,
+            "mcp-session-id": sessionId,
             "mcp-protocol-version": "2025-06-18",
-          }),
-          HttpClientRequest.setBody(
-            HttpBody.jsonUnsafe({
-              jsonrpc: "2.0",
-              id: 0,
-              method: "initialize",
-              params: {
-                protocolVersion: "2025-06-18",
-                capabilities: {},
-                clientInfo: { name: "t3code-peer-probe", version: "1" },
-              },
-            }),
-          ),
-        ),
-      );
-      if (response.status === 401) {
-        yield* recordOutcome(environmentId, resolved.secretName, {
-          error: "The linked environment rejected this link (HTTP 401).",
-          revoked: true,
-        });
-        return yield* new PeerLinkError({
-          reason: "revoked",
-          message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
-        });
-      }
-      if (response.status === 403) {
-        return yield* new PeerLinkError({
-          reason: "unreachable",
-          message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
-        });
-      }
-      if (response.status !== 200) {
-        return yield* new PeerLinkError({
-          reason: "unreachable",
-          message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
-        });
-      }
-      const sessionId = response.headers["mcp-session-id"];
-      if (sessionId === undefined) {
-        return yield* new PeerLinkError({
-          reason: "unreachable",
-          message: `${resolved.link.label} did not return an MCP session for the link check.`,
-        });
-      }
-      const sessionHeaders = {
-        accept: "application/json, text/event-stream",
-        authorization: `Bearer ${resolved.token}`,
-        "mcp-session-id": sessionId,
-        "mcp-protocol-version": "2025-06-18",
-      };
-      const terminate = () =>
-        request(
-          HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
-            HttpClientRequest.setHeaders(sessionHeaders),
-          ),
-        ).pipe(Effect.ignore);
-      yield* Effect.ensuring(
-        request(
-          HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
-            HttpClientRequest.setHeaders(sessionHeaders),
-            HttpClientRequest.setBody(
-              HttpBody.jsonUnsafe({ jsonrpc: "2.0", method: "notifications/initialized" }),
-            ),
-          ),
-        ).pipe(
-          Effect.flatMap((notification) => {
-            if (notification.status === 401) {
-              return recordOutcome(environmentId, resolved.secretName, {
-                error: "The linked environment rejected this link (HTTP 401).",
-                revoked: true,
-              }).pipe(
-                Effect.andThen(
-                  Effect.fail(
-                    new PeerLinkError({
-                      reason: "revoked",
-                      message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
-                    }),
+          };
+          const terminate = () =>
+            Effect.uninterruptibleMask(() =>
+              Effect.interruptible(
+                request(
+                  HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
+                    HttpClientRequest.setHeaders(sessionHeaders),
                   ),
-                ),
-              );
-            }
-            if (notification.status < 200 || notification.status >= 300) {
-              return Effect.fail(
-                new PeerLinkError({
-                  reason: "unreachable",
-                  message: `${resolved.link.label} refused the link check (HTTP ${notification.status}).`,
-                }),
-              );
-            }
-            return Effect.void;
-          }),
-        ),
-        terminate(),
+                ).pipe(Effect.flatMap((deleted) => deleted.text)),
+              ).pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
+            );
+          yield* Effect.ensuring(
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                yield* restore(readResponse(response));
+                const notification = yield* restore(
+                  request(
+                    HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+                      HttpClientRequest.setHeaders(sessionHeaders),
+                      HttpClientRequest.setBody(
+                        HttpBody.jsonUnsafe({
+                          jsonrpc: "2.0",
+                          method: "notifications/initialized",
+                        }),
+                      ),
+                    ),
+                  ),
+                );
+                if (notification.status === 401) {
+                  yield* restore(
+                    notification.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
+                  );
+                  return yield* recordOutcome(environmentId, resolved.secretName, {
+                    error: "The linked environment rejected this link (HTTP 401).",
+                    revoked: true,
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new PeerLinkError({
+                          reason: "revoked",
+                          message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+                        }),
+                      ),
+                    ),
+                  );
+                }
+                if (notification.status < 200 || notification.status >= 300) {
+                  yield* restore(
+                    notification.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
+                  );
+                  return yield* new PeerLinkError({
+                    reason: "unreachable",
+                    message: `${resolved.link.label} refused the link check (HTTP ${notification.status}).`,
+                  });
+                }
+                yield* restore(readResponse(notification));
+              }),
+            ),
+            terminate(),
+          );
+          yield* restore(recordOutcome(environmentId, resolved.secretName, { error: null }));
+          return resolved.link;
+        }),
       );
-      yield* recordOutcome(environmentId, resolved.secretName, { error: null });
-      return resolved.link;
     },
   );
 

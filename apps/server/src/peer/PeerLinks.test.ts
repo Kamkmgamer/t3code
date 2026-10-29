@@ -738,6 +738,86 @@ it.effect("closes duplicate sessions opened by concurrent cache misses", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("reopens a peer session after restart and reuses the replacement", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* probe(a);
+      const firstSessionId = (yield* Ref.get(b.requests))
+        .map((request) => request.split(" ")[2])
+        .find((sessionId) => sessionId !== "");
+      expect(firstSessionId).toBeDefined();
+      yield* Ref.set(b.invalidSessionId, firstSessionId!);
+
+      expect(yield* probe(a)).toMatchObject({ modes: "auto/default" });
+      expect(yield* probe(a)).toMatchObject({ modes: "auto/default" });
+      const sessionIds = (yield* Ref.get(b.requests))
+        .map((request) => request.split(" ")[2])
+        .filter(Boolean);
+      const replacement = sessionIds.find((sessionId) => sessionId !== firstSessionId);
+      expect(replacement).toBeDefined();
+      expect(sessionIds.slice(-4)).toEqual([firstSessionId, replacement, replacement, replacement]);
+      expect(yield* linkedSessions(b)).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["initialize", "notification", "tool call"] as const)(
+  "classifies HTTP 401 from %s responses",
+  (stage) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const b = yield* serveB(box);
+        const a = yield* makeA(laptop);
+        yield* a.links.link({
+          url: b.url,
+          pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+          access: "auto",
+        });
+        if (stage === "tool call") yield* probe(a);
+        const override = { status: 401 };
+        if (stage === "initialize") yield* Ref.set(b.initializeResponse, override);
+        else yield* Ref.set(b.sessionResponse, override);
+
+        const failed = yield* probe(a).pipe(Effect.flip);
+        expect(failed).toMatchObject({ code: "capability_denied" });
+        expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+          Option.some(true),
+        );
+        if (stage === "notification") {
+          expect((yield* Ref.get(b.requests)).at(-1)?.split(" ")[0]).toBe("DELETE");
+        }
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("marks a probe link revoked from HTTP 401", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(b.initializeResponse, { status: 401 });
+
+      const failed = yield* a.links.probe(box.environmentId).pipe(Effect.flip);
+      expect(failed.reason).toBe("revoked");
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("closes the cached MCP session when a tool call gets HTTP 401", () =>
   Effect.scoped(
     Effect.gen(function* () {
