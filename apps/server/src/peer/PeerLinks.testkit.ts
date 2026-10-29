@@ -6,6 +6,7 @@ import {
   type ExecutionEnvironmentDescriptor,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -67,6 +68,8 @@ export const servePeer = <E, R>(
     const bearers = yield* Ref.make<ReadonlyArray<string>>([]);
     const probes = yield* Ref.make(0);
     const requests = yield* Ref.make<ReadonlyArray<string>>([]);
+    const mcpGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
+    const mcpStarted = yield* Deferred.make<void>();
     const layerEnvironment = Layer.succeed(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Ref.get(descriptor).pipe(Effect.map((current) => current.environmentId)),
       getDescriptor: Ref.get(descriptor),
@@ -92,6 +95,13 @@ export const servePeer = <E, R>(
           yield* Ref.update(requests, (seen) => [...seen, `${request.method} ${request.url}`]);
           if (authorization !== undefined) {
             yield* Ref.update(bearers, (seen) => [...seen, authorization]);
+          }
+          if (request.url.startsWith("/mcp") && request.method === "POST") {
+            const gate = yield* Ref.get(mcpGate);
+            if (gate !== null) {
+              yield* Deferred.succeed(mcpStarted, undefined);
+              yield* Deferred.await(gate);
+            }
           }
           return yield* httpEffect;
         }),
@@ -138,6 +148,8 @@ export const servePeer = <E, R>(
       /** How often its descriptor was asked for, as a probe of whether it answers. */
       probes,
       requests,
+      mcpGate,
+      mcpStarted,
       /** The sessions linking created there, which its Connections lists. */
       linkedSessions: auth
         .listSessions()

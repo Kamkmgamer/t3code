@@ -2,6 +2,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { type ExecutionEnvironmentDescriptor, OrchestratorMcpFailure } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -52,6 +53,12 @@ const ProbeToolkit = Toolkit.make(
     failure: OrchestratorMcpFailure,
     failureMode: "return",
   }),
+  Tool.make("looks-revoked", {
+    description: "Returns an ordinary tool failure with the link-revoked wording.",
+    success: Probe,
+    failure: OrchestratorMcpFailure,
+    failureMode: "return",
+  }),
 );
 
 const probeHandlers = McpToolAccess.toLayer(ProbeToolkit, {
@@ -69,6 +76,15 @@ const probeHandlers = McpToolAccess.toLayer(ProbeToolkit, {
   refuse: McpToolAccess.reads(() =>
     Effect.fail(
       new OrchestratorMcpFailure({ code: "thread_not_found", message: "No such thread." }),
+    ),
+  ),
+  "looks-revoked": McpToolAccess.reads(() =>
+    Effect.fail(
+      new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message:
+          "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
+      }),
     ),
   ),
 });
@@ -155,6 +171,16 @@ it.effect("links with a pairing code, and the peer holds its agents to the limit
       // A refusal keeps the peer's reason.
       const notFound = yield* probe(a, undefined, "refuse").pipe(Effect.flip);
       expect(notFound).toMatchObject({ code: "thread_not_found", message: "No such thread." });
+
+      const looksRevoked = yield* probe(a, undefined, "looks-revoked").pipe(Effect.flip);
+      expect(looksRevoked).toMatchObject({
+        code: "capability_denied",
+        message:
+          "The linked environment no longer accepts this link. It may have been revoked there; link it again.",
+      });
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(false),
+      );
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -427,9 +453,35 @@ it.effect("publishes link refreshes for unlink operations", () =>
         pairingCode: (yield* b.auth.issuePairingCredential()).credential,
         access: "auto",
       });
-      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(Effect.forkScoped);
+      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
       expect(yield* a.links.unlink(box.environmentId)).toBe(true);
-      expect(Option.isSome(yield* Fiber.join(refresh))).toBe(true);
+      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("times out a probe whose initialize response never arrives", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpGate, gate);
+      const probe = yield* a.links
+        .probe(box.environmentId)
+        .pipe(Effect.flip, Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(b.mcpStarted);
+      yield* TestClock.adjust(Duration.seconds(3));
+      const failed = yield* Fiber.join(probe);
+      expect(failed.reason).toBe("unreachable");
+      yield* Deferred.succeed(gate, undefined);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -450,8 +502,12 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       ]);
 
       const [session] = yield* linkedSessions(b);
+      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
       yield* b.auth.revokeSession(session!.sessionId);
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["revoked"]);
+      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");

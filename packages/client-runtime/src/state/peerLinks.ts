@@ -33,9 +33,9 @@ export function createPeerLinkEnvironmentAtoms<R, E>(
   });
   const refreshTrigger = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => {
-      get(peerLinkCacheInvalidation(environmentId));
-      get(refreshes({ environmentId, input: {} }));
-      return 0;
+      const invalidation = get(peerLinkCacheInvalidation(environmentId));
+      const remoteRevision = get(refreshes({ environmentId, input: {} }));
+      return { invalidation, remoteRevision };
     }),
   );
   const list = createEnvironmentRpcQueryAtomFamily(runtime, {

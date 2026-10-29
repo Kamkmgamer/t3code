@@ -21,12 +21,11 @@ import * as Base64Url from "effect/encoding/Base64Url";
 import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
@@ -179,12 +178,8 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
-  const refreshes = yield* PubSub.unbounded<number>();
-  const refreshRevision = yield* Ref.make(0);
-  const notifyRefresh = Ref.updateAndGet(refreshRevision, (revision) => revision + 1).pipe(
-    Effect.flatMap((revision) => PubSub.publish(refreshes, revision)),
-    Effect.asVoid,
-  );
+  const refreshRevision = yield* SubscriptionRef.make(0);
+  const notifyRefresh = SubscriptionRef.update(refreshRevision, (revision) => revision + 1);
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -496,6 +491,7 @@ const make = Effect.gen(function* () {
     if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
       yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
     }
+    yield* notifyRefresh;
     return linked;
   });
 
@@ -506,31 +502,64 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => Option.none()),
     );
 
-  const statusOf = (link: PeerLink, now: DateTime.Utc) =>
-    link.revoked === true
-      ? Effect.succeed<PeerLinkStatus>("revoked")
-      : DateTime.isLessThanOrEqualTo(link.expiresAt, now)
-        ? Effect.succeed<PeerLinkStatus>("expired")
-        : probe(link.environmentId).pipe(
-            Effect.as<PeerLinkStatus>("reachable"),
-            Effect.catchTags({
-              PeerLinkError: (error) =>
-                Effect.succeed<PeerLinkStatus>(
-                  error.reason === "revoked"
-                    ? "revoked"
-                    : error.reason === "expired"
-                      ? "expired"
-                      : "unreachable",
+  const statusOf = (row: PeerLinkRow, link: PeerLink, now: DateTime.Utc) => {
+    const initialStatus =
+      link.revoked === true
+        ? Effect.succeed<PeerLinkStatus>("revoked")
+        : DateTime.isLessThanOrEqualTo(link.expiresAt, now)
+          ? Effect.succeed<PeerLinkStatus>("expired")
+          : probe(link.environmentId).pipe(
+              Effect.as<PeerLinkStatus>("reachable"),
+              Effect.catchTags({
+                PeerLinkError: (error) =>
+                  Effect.succeed<PeerLinkStatus>(
+                    error.reason === "revoked"
+                      ? "revoked"
+                      : error.reason === "expired"
+                        ? "expired"
+                        : "unreachable",
+                  ),
+              }),
+            );
+    return initialStatus.pipe(
+      Effect.flatMap((probedStatus) =>
+        readRow(link.environmentId).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.succeed({ link, status: probedStatus }),
+              onSome: (currentRow) =>
+                toLink(currentRow).pipe(
+                  Effect.map((currentLink) => ({
+                    link: currentLink,
+                    status:
+                      currentRow.revoked === 1
+                        ? ("revoked" as const)
+                        : DateTime.isLessThanOrEqualTo(currentLink.expiresAt, now)
+                          ? ("expired" as const)
+                          : currentRow.secret_name === row.secret_name
+                            ? probedStatus
+                            : ("reachable" as const),
+                  })),
                 ),
             }),
-          );
+          ),
+        ),
+      ),
+    );
+  };
 
   const list: PeerLinks["Service"]["list"] = Effect.gen(function* () {
-    const links = yield* Effect.forEach(yield* readRows, toLink);
+    const rows = yield* readRows;
+    const links = yield* Effect.forEach(rows, (row) =>
+      toLink(row).pipe(Effect.map((link) => ({ row, link }))),
+    );
     const now = yield* DateTime.now;
     return yield* Effect.forEach(
       links,
-      (link) => statusOf(link, now).pipe(Effect.map((status) => ({ ...link, status }))),
+      ({ row, link }) =>
+        statusOf(row, link, now).pipe(
+          Effect.map(({ link: current, status }) => ({ ...current, status })),
+        ),
       { concurrency: "unbounded" },
     );
   });
@@ -630,17 +659,25 @@ const make = Effect.gen(function* () {
   ) =>
     DateTime.now.pipe(
       Effect.flatMap((now) =>
-        outcome.error === null
-          ? sql`
-              UPDATE peer_environment_links
-              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL
-              WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
-            `
-          : sql`
-              UPDATE peer_environment_links
-              SET last_error = ${outcome.error}${outcome.revoked === true ? sql`, revoked = 1` : sql``}
-              WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
-            `,
+        Effect.gen(function* () {
+          const updated =
+            outcome.error === null
+              ? yield* sql<{ revoked: number }>`
+                  UPDATE peer_environment_links
+                  SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL
+                  WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
+                    AND revoked = 0
+                  RETURNING revoked
+                `
+              : yield* sql<{ revoked: number }>`
+                  UPDATE peer_environment_links
+                  SET last_error = ${outcome.error}${outcome.revoked === true ? sql`, revoked = 1` : sql``}
+                  WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
+                    AND revoked = 0
+                  RETURNING revoked
+                `;
+          if (outcome.revoked === true && updated.length > 0) yield* notifyRefresh;
+        }),
       ),
       Effect.asVoid,
       Effect.ignoreCause({ log: true }),
@@ -653,7 +690,19 @@ const make = Effect.gen(function* () {
         peerHttpClient
           .execute(request)
           .pipe(Effect.flatMap((response) => response.text.pipe(Effect.as(response))));
-      const response = yield* executeDrained(
+      const request = (request: HttpClientRequest.HttpClientRequest) =>
+        executeDrained(request).pipe(
+          Effect.timeout(probeTimeout(resolved.url)),
+          Effect.mapError(
+            (cause) =>
+              new PeerLinkError({
+                reason: "unreachable",
+                message: `${resolved.link.label} stopped answering while checking its link.`,
+                cause,
+              }),
+          ),
+        );
+      const response = yield* request(
         HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
           HttpClientRequest.setHeaders({
             accept: "application/json, text/event-stream",
@@ -672,16 +721,6 @@ const make = Effect.gen(function* () {
               },
             }),
           ),
-        ),
-      ).pipe(
-        Effect.timeout(probeTimeout(resolved.url)),
-        Effect.mapError(
-          (cause) =>
-            new PeerLinkError({
-              reason: "unreachable",
-              message: `${resolved.link.label} stopped answering while checking its link.`,
-              cause,
-            }),
         ),
       );
       if (response.status === 401) {
@@ -720,20 +759,47 @@ const make = Effect.gen(function* () {
         "mcp-protocol-version": "2025-06-18",
       };
       const terminate = () =>
-        executeDrained(
+        request(
           HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
             HttpClientRequest.setHeaders(sessionHeaders),
           ),
         ).pipe(Effect.ignore);
       yield* Effect.ensuring(
-        executeDrained(
+        request(
           HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
             HttpClientRequest.setHeaders(sessionHeaders),
             HttpClientRequest.setBody(
               HttpBody.jsonUnsafe({ jsonrpc: "2.0", method: "notifications/initialized" }),
             ),
           ),
-        ).pipe(Effect.ignore),
+        ).pipe(
+          Effect.flatMap((notification) => {
+            if (notification.status === 401) {
+              return recordOutcome(environmentId, resolved.secretName, {
+                error: "The linked environment rejected this link (HTTP 401).",
+                revoked: true,
+              }).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new PeerLinkError({
+                      reason: "revoked",
+                      message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+                    }),
+                  ),
+                ),
+              );
+            }
+            if (notification.status < 200 || notification.status >= 300) {
+              return Effect.fail(
+                new PeerLinkError({
+                  reason: "unreachable",
+                  message: `${resolved.link.label} refused the link check (HTTP ${notification.status}).`,
+                }),
+              );
+            }
+            return Effect.void;
+          }),
+        ),
         terminate(),
       );
       yield* recordOutcome(environmentId, resolved.secretName, { error: null });
@@ -746,7 +812,9 @@ const make = Effect.gen(function* () {
     link,
     describe: describeUrl,
     list,
-    subscribeRefreshes: Stream.fromPubSub(refreshes),
+    subscribeRefreshes: SubscriptionRef.changes(refreshRevision).pipe(
+      Stream.filter((revision) => revision > 0),
+    ),
     get,
     unlink,
     resolve,

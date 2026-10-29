@@ -6,10 +6,12 @@ import {
   type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
@@ -64,17 +66,18 @@ const decodeFailure = Schema.decodeUnknownOption(
     Schema.Struct({ code: OrchestratorMcpFailure.fields.code, message: Schema.String }),
   ),
 );
-const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 const LINK_REVOKED_MESSAGE =
   "The linked environment no longer accepts this link. It may have been revoked there; link it again.";
 
+class PeerMcpUnauthorized extends Error {
+  readonly _tag = "PeerMcpUnauthorized" as const;
+}
+
+const isPeerMcpUnauthorized = (error: unknown): error is PeerMcpUnauthorized =>
+  error instanceof PeerMcpUnauthorized;
+
 const revokedLinkFailure = () =>
   new OrchestratorMcpFailure({ code: "capability_denied", message: LINK_REVOKED_MESSAGE });
-
-const isRevokedLinkFailure = (error: unknown): error is OrchestratorMcpFailure =>
-  isOrchestratorMcpFailure(error) &&
-  error.code === "capability_denied" &&
-  error.message === LINK_REVOKED_MESSAGE;
 
 /** A peer link problem, as the agent that asked hears it. */
 const fromLinkError = (error: PeerLinkError) =>
@@ -112,7 +115,9 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   // One MCP session per peer and address, reused across calls. The peer keeps
   // sessions in memory, so a restart there answers 404 and we start a new one.
-  const sessions = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  const sessions = yield* Ref.make<
+    ReadonlyMap<string, { url: string; token: string; sessionId: string }>
+  >(new Map());
 
   const post = (url: string, token: string, body: unknown, headers: Record<string, string>) =>
     httpClient.execute(
@@ -125,6 +130,37 @@ const make = Effect.gen(function* () {
         HttpClientRequest.setBody(HttpBody.text(JSON.stringify(body), "application/json")),
       ),
     );
+
+  const closeSession = (session: { url: string; token: string; sessionId: string }) =>
+    httpClient
+      .execute(
+        HttpClientRequest.make("DELETE")(`${session.url}/mcp`).pipe(
+          HttpClientRequest.setHeaders({
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${session.token}`,
+            "mcp-session-id": session.sessionId,
+            "mcp-protocol-version": PROTOCOL_VERSION,
+          }),
+        ),
+      )
+      .pipe(
+        Effect.flatMap((response) => response.text),
+        Effect.timeout(Duration.seconds(3)),
+        Effect.ignore,
+      );
+
+  const clearSessions = Effect.gen(function* () {
+    const current = yield* Ref.modify(sessions, (sessions) => [
+      Array.from(sessions.values()),
+      new Map(),
+    ]);
+    yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
+  });
+
+  yield* links.subscribeRefreshes.pipe(
+    Stream.runForEach(() => clearSessions),
+    Effect.forkScoped({ startImmediately: true }),
+  );
 
   const openSession = Effect.fn("PeerMcpClient.openSession")(function* (
     url: string,
@@ -146,23 +182,30 @@ const make = Effect.gen(function* () {
       },
       limitHeader,
     );
+    yield* initialized.text;
     const sessionId = initialized.headers["mcp-session-id"];
     if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
+    if (initialized.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
     if (initialized.status !== 200 || sessionId === undefined) {
       return yield* new OrchestratorMcpFailure({
-        code: initialized.status === 401 ? "capability_denied" : "orchestration_error",
-        message:
-          initialized.status === 401
-            ? LINK_REVOKED_MESSAGE
-            : `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
+        code: "orchestration_error",
+        message: `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,
       });
     }
-    yield* post(
+    const notification = yield* post(
       url,
       token,
       { jsonrpc: "2.0", method: "notifications/initialized" },
       { ...limitHeader, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION },
     );
+    yield* notification.text;
+    if (notification.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
+    if (notification.status < 200 || notification.status >= 300) {
+      return yield* new OrchestratorMcpFailure({
+        code: "orchestration_error",
+        message: `The linked environment refused to initialize the MCP session (HTTP ${notification.status}).`,
+      });
+    }
     return sessionId;
   });
 
@@ -188,20 +231,45 @@ const make = Effect.gen(function* () {
       const callEffect = Effect.gen(function* () {
         const existing = (yield* Ref.get(sessions)).get(sessionKey);
         const sessionId =
-          existing ?? (yield* openSession(resolved.url, resolved.token, limitHeader));
+          existing?.sessionId ?? (yield* openSession(resolved.url, resolved.token, limitHeader));
         let response = yield* callOnce(sessionId);
         if (response.status === 404) {
+          yield* response.text;
           const renewed = yield* openSession(resolved.url, resolved.token, limitHeader);
-          yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
+          yield* Ref.update(sessions, (current) =>
+            new Map(current).set(sessionKey, {
+              url: resolved.url,
+              token: resolved.token,
+              sessionId: renewed,
+            }),
+          );
           response = yield* callOnce(renewed);
         } else if (existing === undefined) {
-          yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, sessionId));
+          yield* Ref.update(sessions, (current) =>
+            new Map(current).set(sessionKey, {
+              url: resolved.url,
+              token: resolved.token,
+              sessionId,
+            }),
+          );
         }
         if (response.status === 401) {
-          return yield* revokedLinkFailure();
+          yield* response.text;
+          const session = yield* Ref.modify(sessions, (current) => {
+            const session = current.get(sessionKey);
+            const next = new Map(current);
+            next.delete(sessionKey);
+            return [session, next];
+          });
+          if (session !== undefined) yield* closeSession(session);
+          return yield* Effect.fail(new PeerMcpUnauthorized());
         }
-        if (response.status === 403) return yield* linkedEnvironmentsOffThere;
+        if (response.status === 403) {
+          yield* response.text;
+          return yield* linkedEnvironmentsOffThere;
+        }
         if (response.status !== 200) {
+          yield* response.text;
           return yield* new OrchestratorMcpFailure({
             code: "orchestration_error",
             message: `The linked environment answered HTTP ${response.status}.`,
@@ -253,15 +321,18 @@ const make = Effect.gen(function* () {
       return yield* callEffect.pipe(
         Effect.tapError((error) =>
           links.recordOutcome(input.environmentId, resolved.secretName, {
-            error: error.message,
-            ...(isRevokedLinkFailure(error) ? { revoked: true } : {}),
+            error: isPeerMcpUnauthorized(error)
+              ? LINK_REVOKED_MESSAGE
+              : error instanceof Error
+                ? error.message
+                : "The linked environment rejected the call.",
+            ...(isPeerMcpUnauthorized(error) ? { revoked: true } : {}),
           }),
         ),
         Effect.tap(() =>
           links.recordOutcome(input.environmentId, resolved.secretName, { error: null }),
         ),
-        // A revoked link keeps its explicit 401 message; other failures retain
-        // the transport's own message for the agent.
+        Effect.catchIf(isPeerMcpUnauthorized, () => Effect.fail(revokedLinkFailure())),
         Effect.catchTags({
           HttpClientError: () =>
             Effect.fail(
