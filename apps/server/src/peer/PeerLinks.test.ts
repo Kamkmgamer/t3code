@@ -6,7 +6,11 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as HttpClientRequest from "effect/http/HttpClientRequest";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
+import * as HttpClientError from "effect/http/HttpClientError";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -35,6 +39,7 @@ import {
   type ProbeTracker,
   servePeer,
   type ServedPeer,
+  layerHttpClientResponseTransform,
 } from "./PeerLinks.testkit.ts";
 import * as PeerMcpClient from "./PeerMcpClient.ts";
 
@@ -102,8 +107,9 @@ const serveB = (descriptor: ExecutionEnvironmentDescriptor, probeTracker?: Probe
 const makeA = (
   descriptor: ExecutionEnvironmentDescriptor,
   secrets?: typeof ServerSecretStore.layer,
+  httpClient?: Layer.Layer<HttpClient.HttpClient>,
 ) =>
-  layerLinkingEnvironment(descriptor, secrets).pipe(
+  layerLinkingEnvironment(descriptor, secrets, httpClient).pipe(
     Layer.build,
     Effect.map((context) => ({
       links: Context.get(context, PeerLinks.PeerLinks),
@@ -135,6 +141,58 @@ const probe = (
 ) => callPeer(a, box.environmentId, limits, tool);
 
 const linkedSessions = (b: ServedPeer) => b.linkedSessions;
+
+const controlledInitializeResponse = (
+  active: Ref.Ref<boolean>,
+  observed: Deferred.Deferred<{ readonly status: number; readonly sessionId: string | undefined }>,
+  body: (
+    request: HttpClientRequest.HttpClientRequest,
+    response: HttpClientResponse.HttpClientResponse,
+  ) => Effect.Effect<string, HttpClientError.HttpClientError>,
+) =>
+  layerHttpClientResponseTransform((request, response) =>
+    Effect.gen(function* () {
+      if (
+        !(yield* Ref.get(active)) ||
+        request.url.endsWith("/mcp") === false ||
+        request.method !== "POST" ||
+        request.headers["mcp-session-id"] !== undefined ||
+        (response.status !== 200 && response.status !== 401)
+      ) {
+        return response;
+      }
+      const sessionId = response.headers["mcp-session-id"];
+      yield* Deferred.succeed(observed, { status: response.status, sessionId });
+      Object.defineProperty(response, "text", {
+        configurable: true,
+        value: Effect.suspend(() => body(request, response)),
+      });
+      return response;
+    }),
+  );
+
+const failureBody = (
+  request: HttpClientRequest.HttpClientRequest,
+  response: HttpClientResponse.HttpClientResponse,
+) =>
+  Effect.fail(
+    new HttpClientError.HttpClientError({
+      reason: new HttpClientError.DecodeError({
+        request,
+        response,
+        description: "controlled response body failure",
+      }),
+    }),
+  );
+
+const callPeerTool = (a: Effect.Success<ReturnType<typeof makeA>>) =>
+  a.peer.call({
+    environmentId: box.environmentId,
+    tool: "probe",
+    arguments: {},
+    limits: { runtimeMode: "full-access", interactionMode: "default" },
+    success: Probe,
+  });
 
 /** Another environment on a socket of its own, answering as `descriptor`. */
 const serveApart = (descriptor: ExecutionEnvironmentDescriptor, probeTracker?: ProbeTracker) =>
@@ -448,6 +506,208 @@ it.effect("closes an MCP session when initialized notification is interrupted", 
       yield* Deferred.succeed(gate, undefined);
 
       expect((yield* Ref.get(b.requests)).slice(-1)[0]?.split(" ")[0]).toBe("DELETE");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes a probe session when the initialize body fails after its headers arrive", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        controlledInitializeResponse(active, observed, (request, response) =>
+          Deferred.succeed(bodyStarted, undefined).pipe(
+            Effect.andThen(failureBody(request, response)),
+          ),
+        ),
+      );
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(active, true);
+
+      const failed = yield* Effect.exit(a.links.probe(box.environmentId));
+      const headers = yield* Deferred.await(observed);
+      yield* Deferred.await(bodyStarted);
+      expect(Exit.isFailure(failed)).toBe(true);
+      expect(headers.status).toBe(200);
+      expect(headers.sessionId).toBeDefined();
+      expect(
+        (yield* Ref.get(b.requests)).filter((request) => request.startsWith("DELETE ")),
+      ).toEqual([`DELETE /mcp ${headers.sessionId}`]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes a tool session when the initialize body fails after its headers arrive", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        controlledInitializeResponse(active, observed, (request, response) =>
+          Deferred.succeed(bodyStarted, undefined).pipe(
+            Effect.andThen(failureBody(request, response)),
+          ),
+        ),
+      );
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(active, true);
+
+      const failed = yield* Effect.exit(callPeerTool(a));
+      const headers = yield* Deferred.await(observed);
+      yield* Deferred.await(bodyStarted);
+      expect(Exit.isFailure(failed)).toBe(true);
+      expect(headers.status).toBe(200);
+      expect(headers.sessionId).toBeDefined();
+      expect(
+        (yield* Ref.get(b.requests)).filter((request) => request.startsWith("DELETE ")),
+      ).toEqual([`DELETE /mcp ${headers.sessionId}`]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes a tool session when its initialize body times out", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = yield* Deferred.make<void>();
+      const bodyGate = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        controlledInitializeResponse(active, observed, () =>
+          Deferred.succeed(bodyStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(bodyGate)),
+            Effect.as(""),
+          ),
+        ),
+      );
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(active, true);
+
+      const pending = yield* Effect.exit(callPeerTool(a)).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const headers = yield* Deferred.await(observed);
+      yield* Deferred.await(bodyStarted);
+      yield* TestClock.adjust(Duration.seconds(3));
+      const failed = yield* Fiber.join(pending);
+      expect(Exit.isFailure(failed)).toBe(true);
+      expect(headers.status).toBe(200);
+      expect(headers.sessionId).toBeDefined();
+      expect(
+        (yield* Ref.get(b.requests)).filter((request) => request.startsWith("DELETE ")),
+      ).toEqual([`DELETE /mcp ${headers.sessionId}`]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("revokes a probe link when HTTP 401 has a failed body", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = yield* Ref.make(false);
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        controlledInitializeResponse(active, observed, (request, response) =>
+          Ref.set(bodyStarted, true).pipe(Effect.andThen(failureBody(request, response))),
+        ),
+      );
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(b.initializeResponse, { status: 401 });
+      yield* Ref.set(active, true);
+
+      const failed = yield* a.links.probe(box.environmentId).pipe(Effect.flip);
+      const headers = yield* Deferred.await(observed);
+      expect(failed.reason).toBe("revoked");
+      expect(headers).toEqual({ status: 401, sessionId: undefined });
+      expect(yield* Ref.get(bodyStarted)).toBe(false);
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("revokes a tool link when HTTP 401 has a pending initialize body", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = yield* Ref.make(false);
+      const bodyGate = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        controlledInitializeResponse(active, observed, () =>
+          Ref.set(bodyStarted, true).pipe(Effect.andThen(Deferred.await(bodyGate)), Effect.as("")),
+        ),
+      );
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* Ref.set(b.initializeResponse, { status: 401 });
+      yield* Ref.set(active, true);
+
+      const pending = yield* Effect.exit(callPeerTool(a)).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const headers = yield* Deferred.await(observed);
+      yield* TestClock.adjust(Duration.seconds(3));
+      const failed = yield* Fiber.join(pending);
+      expect(Exit.isFailure(failed)).toBe(true);
+      expect(headers).toEqual({ status: 401, sessionId: undefined });
+      expect(yield* Ref.get(bodyStarted)).toBe(false);
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

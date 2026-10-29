@@ -238,9 +238,9 @@ const make = Effect.gen(function* () {
         );
         const sessionId = initialized.headers["mcp-session-id"];
         if (initialized.status !== 200) {
+          if (initialized.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
           yield* restore(drainResponse(initialized));
           if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
-          if (initialized.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
           return yield* new OrchestratorMcpFailure({
             code: "orchestration_error",
             message: `The linked environment refused to start an MCP session (HTTP ${initialized.status}).`,

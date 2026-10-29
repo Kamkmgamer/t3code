@@ -11,6 +11,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientError from "effect/http/HttpClientError";
+import type * as HttpClientRequest from "effect/http/HttpClientRequest";
+import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServer from "effect/http/HttpServer";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
@@ -244,12 +248,13 @@ export type ServedPeer = Effect.Success<ReturnType<typeof servePeer>>;
 export const layerLinkingEnvironment = (
   descriptor: ExecutionEnvironmentDescriptor,
   secrets: typeof ServerSecretStore.layer = ServerSecretStore.layer,
+  httpClient: Layer.Layer<HttpClient.HttpClient> = FetchHttpClient.layer,
 ) =>
   PeerMcpClient.layer.pipe(
     Layer.provideMerge(PeerLinks.layer),
     Layer.provideMerge(ServerSettings.layerTest({ linkedEnvironmentsEnabled: true })),
     Layer.provideMerge(Sqlite.layerMemory),
-    Layer.provide(Layer.mergeAll(secrets, FetchHttpClient.layer)),
+    Layer.provide(Layer.mergeAll(secrets, httpClient)),
     // Services that act for this environment, such as delegation, name it too.
     Layer.provideMerge(
       Layer.succeed(ServerEnvironment.ServerEnvironment, {
@@ -261,6 +266,27 @@ export const layerLinkingEnvironment = (
     Layer.provideMerge(NodeServices.layer),
     Layer.fresh,
   );
+
+/** Wraps the real client so tests can control response-body reads after headers arrive. */
+export const layerHttpClientResponseTransform = (
+  transform: (
+    request: HttpClientRequest.HttpClientRequest,
+    response: HttpClientResponse.HttpClientResponse,
+  ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
+) =>
+  Layer.effect(
+    HttpClient.HttpClient,
+    Effect.map(HttpClient.HttpClient, (base): HttpClient.HttpClient =>
+      HttpClient.transform<
+        HttpClientError.HttpClientError,
+        never,
+        HttpClientError.HttpClientError,
+        never
+      >((response, request) => response.pipe(Effect.flatMap((value) => transform(request, value))))(
+        base,
+      ),
+    ),
+  ).pipe(Layer.provideMerge(FetchHttpClient.layer));
 
 /** Links `links` to `peer` with a fresh pairing code from it. */
 export const linkTo = (

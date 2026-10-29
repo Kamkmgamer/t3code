@@ -758,7 +758,6 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const response = yield* restore(request(initRequest));
           if (response.status === 401) {
-            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
             yield* recordOutcome(environmentId, resolved.secretName, {
               error: "The linked environment rejected this link (HTTP 401).",
               revoked: true,
