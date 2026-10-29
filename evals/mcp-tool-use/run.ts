@@ -1320,7 +1320,10 @@ const matches = (expected: unknown, actual: unknown): boolean => {
     return typeof actual === "number" && (bound[1] === "<=" ? actual <= limit : actual >= limit);
   }
   if (typeof expected === "string" && expected.startsWith("~")) {
-    return valueText(actual).toLowerCase().includes(expected.slice(1).toLowerCase());
+    return (
+      actual !== undefined &&
+      valueText(actual).toLowerCase().includes(expected.slice(1).toLowerCase())
+    );
   }
   if (Array.isArray(expected)) {
     return (

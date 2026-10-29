@@ -161,6 +161,18 @@ it("passes a good run and names every rule a bad run breaks", () => {
   ]);
 });
 
+it("does not match a missing partial argument", () => {
+  const run: SampleRun = {
+    calls: [{ step: 0, tool: "t3_environment_link", input: { hint: "Build VPS" } }],
+    text: "",
+    stopReason: "end_turn",
+  };
+  assert.deepEqual(
+    failed({ callsMustNot: [{ tool: "t3_environment_link", args: { pairingCode: "~" } }] }, run),
+    [],
+  );
+});
+
 it("bounds numbers and reads target.options in either schema form", () => {
   const expect = {
     calls: [
