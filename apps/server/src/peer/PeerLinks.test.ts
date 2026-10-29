@@ -395,7 +395,7 @@ it.effect.each([
   [500, "orchestration_error"],
 ] as const)(
   "closes an MCP session when initialized notification fails with HTTP %s",
-  (status, code) =>
+  ([status, code]) =>
     Effect.scoped(
       Effect.gen(function* () {
         const b = yield* serveB(box);

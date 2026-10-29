@@ -560,9 +560,7 @@ const make = Effect.gen(function* () {
       links,
       ({ row, link }) =>
         statusOf(row, link, now).pipe(
-          Effect.map(
-            Option.map(({ link: currentLink, status }) => ({ ...currentLink, status })),
-          ),
+          Effect.map(Option.map(({ link: currentLink, status }) => ({ ...currentLink, status }))),
         ),
       { concurrency: "unbounded" },
     );

@@ -156,14 +156,13 @@ const make = Effect.gen(function* () {
         Effect.ignore,
       );
 
-  const clearSessions = (generation: number) =>
-    Effect.gen(function* () {
-      const current = yield* Ref.modify(sessionState, (state) => [
-        Array.from(state.sessions.values()),
-        { generation, sessions: new Map() },
-      ]);
-      yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
-    });
+  const clearSessions = Effect.fn("PeerMcpClient.clearSessions")(function* (generation: number) {
+    const current = yield* Ref.modify(sessionState, (state) => [
+      Array.from(state.sessions.values()),
+      { generation, sessions: new Map() },
+    ]);
+    yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
+  });
 
   yield* links.subscribeRefreshes.pipe(
     Stream.runForEach(clearSessions),
@@ -228,11 +227,7 @@ const make = Effect.gen(function* () {
         });
       }
       return sessionId;
-    }).pipe(
-      Effect.onExit((exit) =>
-        Exit.isFailure(exit) ? closeSession(session) : Effect.void,
-      ),
-    );
+    }).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? closeSession(session) : Effect.void)));
   });
 
   const call: PeerMcpClient["Service"]["call"] = Effect.fn("PeerMcpClient.call")(function* (input) {
