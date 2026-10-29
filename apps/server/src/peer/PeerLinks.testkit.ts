@@ -70,6 +70,9 @@ export const servePeer = <E, R>(
     const requests = yield* Ref.make<ReadonlyArray<string>>([]);
     const mcpGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     const mcpStarted = yield* Deferred.make<void>();
+    const mcpNotificationGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
+    const mcpNotificationStarted = yield* Deferred.make<void>();
+    const mcpNotificationStatus = yield* Ref.make<number | null>(null);
     const layerEnvironment = Layer.succeed(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Ref.get(descriptor).pipe(Effect.map((current) => current.environmentId)),
       getDescriptor: Ref.get(descriptor),
@@ -97,10 +100,18 @@ export const servePeer = <E, R>(
             yield* Ref.update(bearers, (seen) => [...seen, authorization]);
           }
           if (request.url.startsWith("/mcp") && request.method === "POST") {
-            const gate = yield* Ref.get(mcpGate);
+            const notification = request.headers["mcp-session-id"] !== undefined;
+            const gate = yield* Ref.get(notification ? mcpNotificationGate : mcpGate);
             if (gate !== null) {
-              yield* Deferred.succeed(mcpStarted, undefined);
+              yield* Deferred.succeed(
+                notification ? mcpNotificationStarted : mcpStarted,
+                undefined,
+              );
               yield* Deferred.await(gate);
+            }
+            if (notification) {
+              const status = yield* Ref.get(mcpNotificationStatus);
+              if (status !== null) return HttpServerResponse.empty({ status });
             }
           }
           return yield* httpEffect;
@@ -150,6 +161,9 @@ export const servePeer = <E, R>(
       requests,
       mcpGate,
       mcpStarted,
+      mcpNotificationGate,
+      mcpNotificationStarted,
+      mcpNotificationStatus,
       /** The sessions linking created there, which its Connections lists. */
       linkedSessions: auth
         .listSessions()

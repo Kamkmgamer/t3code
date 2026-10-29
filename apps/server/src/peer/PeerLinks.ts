@@ -526,20 +526,22 @@ const make = Effect.gen(function* () {
         readRow(link.environmentId).pipe(
           Effect.flatMap(
             Option.match({
-              onNone: () => Effect.succeed({ link, status: probedStatus }),
+              onNone: () => Effect.succeedNone,
               onSome: (currentRow) =>
                 toLink(currentRow).pipe(
-                  Effect.map((currentLink) => ({
-                    link: currentLink,
-                    status:
-                      currentRow.revoked === 1
-                        ? ("revoked" as const)
-                        : DateTime.isLessThanOrEqualTo(currentLink.expiresAt, now)
-                          ? ("expired" as const)
-                          : currentRow.secret_name === row.secret_name
-                            ? probedStatus
-                            : ("reachable" as const),
-                  })),
+                  Effect.map((currentLink) =>
+                    Option.some({
+                      link: currentLink,
+                      status:
+                        currentRow.revoked === 1
+                          ? ("revoked" as const)
+                          : DateTime.isLessThanOrEqualTo(currentLink.expiresAt, now)
+                            ? ("expired" as const)
+                            : currentRow.secret_name === row.secret_name
+                              ? probedStatus
+                              : ("reachable" as const),
+                    }),
+                  ),
                 ),
             }),
           ),
@@ -554,14 +556,17 @@ const make = Effect.gen(function* () {
       toLink(row).pipe(Effect.map((link) => ({ row, link }))),
     );
     const now = yield* DateTime.now;
-    return yield* Effect.forEach(
+    const current = yield* Effect.forEach(
       links,
       ({ row, link }) =>
         statusOf(row, link, now).pipe(
-          Effect.map(({ link: current, status }) => ({ ...current, status })),
+          Effect.map(
+            Option.map(({ link: currentLink, status }) => ({ ...currentLink, status })),
+          ),
         ),
       { concurrency: "unbounded" },
     );
+    return current.flatMap((value) => (Option.isSome(value) ? [value.value] : []));
   });
 
   const get: PeerLinks["Service"]["get"] = (environmentId) =>

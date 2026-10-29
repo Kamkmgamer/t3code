@@ -346,6 +346,129 @@ it.effect("never follows a peer's redirect with the pairing code", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("never follows an authenticated MCP redirect with its token", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const received = yield* Ref.make<ReadonlyArray<string>>([]);
+      const elsewhere = yield* serveRaw((request) =>
+        Ref.update(received, (seen) => [
+          ...seen,
+          `${request.method} ${request.url} ${request.headers.authorization ?? ""}`,
+        ]).pipe(Effect.as(HttpServerResponse.empty({ status: 404 }))),
+      );
+      const front = yield* serveRaw((request) =>
+        request.url.startsWith("/.well-known/t3/environment")
+          ? HttpClient.get(`${b.url}${request.url}`).pipe(
+              Effect.flatMap((response) => response.text),
+              Effect.map((body) =>
+                HttpServerResponse.text(body, { contentType: "application/json" }),
+              ),
+              Effect.provide(FetchHttpClient.layer),
+              Effect.orDie,
+            )
+          : Effect.succeed(
+              HttpServerResponse.empty({
+                status: 307,
+                headers: { location: `${elsewhere}${request.url}` },
+              }),
+            ),
+      );
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* a.sql`UPDATE peer_environment_links SET urls_json = ${JSON.stringify([front])}`;
+
+      const failed = yield* probe(a).pipe(Effect.flip);
+      expect(failed).toMatchObject({ code: "orchestration_error" });
+      expect(yield* Ref.get(received)).toEqual([]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each([
+  [401, "capability_denied"],
+  [403, "orchestration_error"],
+  [500, "orchestration_error"],
+] as const)(
+  "closes an MCP session when initialized notification fails with HTTP %s",
+  (status, code) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const b = yield* serveB(box);
+        const a = yield* makeA(laptop);
+        yield* a.links.link({
+          url: b.url,
+          pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+          access: "auto",
+        });
+        yield* Ref.set(b.mcpNotificationStatus, status);
+
+        const failed = yield* probe(a).pipe(Effect.flip);
+        expect(failed).toMatchObject({ code });
+        expect(
+          (yield* Ref.get(b.requests)).slice(-3).map((request) => request.split(" ")[0]),
+        ).toEqual(["POST", "POST", "DELETE"]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes an MCP session when initialized notification is interrupted", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpNotificationGate, gate);
+      const pending = yield* probe(a).pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(b.mcpNotificationStarted);
+      yield* Fiber.interrupt(pending);
+      yield* Deferred.succeed(gate, undefined);
+
+      expect((yield* Ref.get(b.requests)).slice(-1)[0]?.split(" ")[0]).toBe("DELETE");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("does not publish an MCP session opened across an unlink refresh", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpGate, gate);
+      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const pending = yield* probe(a).pipe(
+        Effect.flip,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.await(b.mcpStarted);
+      expect(yield* a.links.unlink(box.environmentId)).toBe(true);
+      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+      yield* Deferred.succeed(gate, undefined);
+
+      const failed = yield* Fiber.join(pending);
+      expect(failed).toMatchObject({ code: "orchestration_error" });
+      expect((yield* Ref.get(b.requests)).slice(-1)[0]?.split(" ")[0]).toBe("DELETE");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("never sends a link's token to an address that stops answering as that peer", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -458,6 +581,28 @@ it.effect("publishes link refreshes for unlink operations", () =>
       );
       expect(yield* a.links.unlink(box.environmentId)).toBe(true);
       expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("omits a link unlinked while its status probe is in flight", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpGate, gate);
+      const pending = yield* a.links.list.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(b.mcpStarted);
+      expect(yield* a.links.unlink(box.environmentId)).toBe(true);
+      yield* Deferred.succeed(gate, undefined);
+
+      expect(yield* Fiber.join(pending)).toEqual([]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
