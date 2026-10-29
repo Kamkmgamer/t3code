@@ -613,6 +613,61 @@ it.effect("publishes link refreshes for unlink operations", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("refreshes and evicts an unlinked peer even when secret removal fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const failedRemovals = yield* Ref.make(0);
+      const failingSecrets = Layer.effect(
+        ServerSecretStore.ServerSecretStore,
+        Effect.map(ServerSecretStore.make, (store) =>
+          ServerSecretStore.ServerSecretStore.of({
+            ...store,
+            remove: (name) =>
+              Ref.update(failedRemovals, (count) => count + 1).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new ServerSecretStore.SecretStoreRemoveError({
+                      resource: name,
+                      cause: "test failure",
+                    }),
+                  ),
+                ),
+              ),
+          }),
+        ),
+      );
+      const a = yield* makeA(laptop, failingSecrets);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* probe(a);
+      const refresh = yield* Stream.runHead(
+        a.links.subscribeRefreshes.pipe(
+          Stream.filter((event) => event.environmentId === box.environmentId),
+        ),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
+
+      const failed = yield* a.links.unlink(box.environmentId).pipe(Effect.flip);
+      expect(failed.reason).toBe("storage");
+      expect(Option.isNone(yield* a.links.get(box.environmentId))).toBe(true);
+      expect(yield* Ref.get(failedRemovals)).toBe(1);
+      yield* Deferred.await(b.mcpDeleteStarted);
+      expect(
+        Option.map(yield* Fiber.join(refresh), ({ revision, environmentId }) => ({
+          revision,
+          environmentId,
+        })),
+      ).toEqual(Option.some({ revision: 1, environmentId: box.environmentId }));
+      expect((yield* Ref.get(b.requests)).map((request) => request.split(" ")[0])).toContain(
+        "DELETE",
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("refreshing one peer keeps another peer session usable", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -679,6 +734,29 @@ it.effect("closes duplicate sessions opened by concurrent cache misses", () =>
       expect(
         (yield* Ref.get(b.requests)).filter((request) => request.startsWith("DELETE ")),
       ).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes the cached MCP session when a tool call gets HTTP 401", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* callPeer(a, box.environmentId);
+      const [session] = yield* linkedSessions(b);
+      yield* b.auth.revokeSession(session!.sessionId);
+
+      const failed = yield* callPeer(a, box.environmentId).pipe(Effect.flip);
+      expect(failed).toMatchObject({ code: "capability_denied" });
+      expect(
+        (yield* Ref.get(b.requests)).map((request) => request.split(" ")[0]).slice(-2),
+      ).toEqual(["POST", "DELETE"]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

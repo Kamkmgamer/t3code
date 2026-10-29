@@ -598,11 +598,13 @@ const make = Effect.gen(function* () {
         DELETE FROM peer_environment_links WHERE environment_id = ${environmentId}
         RETURNING secret_name
       `.pipe(Effect.catch(failStorage));
-      for (const row of deleted) {
-        yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
-      }
       if (deleted.length > 0) {
         for (const row of deleted) yield* notifyRefresh(environmentId, row.secret_name);
+      }
+      // Evict local caches as soon as the row is gone; retain the storage
+      // failure if removing the now-unreferenced secret does not succeed.
+      for (const row of deleted) {
+        yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
       }
       return deleted.length > 0;
     },

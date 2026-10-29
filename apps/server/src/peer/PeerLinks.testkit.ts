@@ -84,6 +84,7 @@ export const servePeer = <E, R>(
     const mcpNotificationGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     const mcpNotificationStarted = yield* Deferred.make<void>();
     const mcpNotificationStatus = yield* Ref.make<number | null>(null);
+    const mcpDeleteStarted = yield* Deferred.make<void>();
     const layerEnvironment = Layer.succeed(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Ref.get(descriptor).pipe(Effect.map((current) => current.environmentId)),
       getDescriptor: Ref.get(descriptor),
@@ -115,6 +116,9 @@ export const servePeer = <E, R>(
           }
           const authorization = request.headers.authorization;
           yield* Ref.update(requests, (seen) => [...seen, `${request.method} ${request.url}`]);
+          if (request.url.startsWith("/mcp") && request.method === "DELETE") {
+            yield* Deferred.succeed(mcpDeleteStarted, undefined);
+          }
           if (authorization !== undefined) {
             yield* Ref.update(bearers, (seen) => [...seen, authorization]);
           }
@@ -194,6 +198,7 @@ export const servePeer = <E, R>(
       mcpNotificationGate,
       mcpNotificationStarted,
       mcpNotificationStatus,
+      mcpDeleteStarted,
       /** The sessions linking created there, which its Connections lists. */
       linkedSessions: auth
         .listSessions()

@@ -152,22 +152,24 @@ const make = Effect.gen(function* () {
     );
 
   const closeSession = (session: Session) =>
-    peerHttpClient
-      .execute(
-        HttpClientRequest.make("DELETE")(`${session.url}/mcp`).pipe(
-          HttpClientRequest.setHeaders({
-            accept: "application/json, text/event-stream",
-            authorization: `Bearer ${session.token}`,
-            "mcp-session-id": session.sessionId,
-            "mcp-protocol-version": PROTOCOL_VERSION,
-          }),
+    Effect.uninterruptible(
+      peerHttpClient
+        .execute(
+          HttpClientRequest.make("DELETE")(`${session.url}/mcp`).pipe(
+            HttpClientRequest.setHeaders({
+              accept: "application/json, text/event-stream",
+              authorization: `Bearer ${session.token}`,
+              "mcp-session-id": session.sessionId,
+              "mcp-protocol-version": PROTOCOL_VERSION,
+            }),
+          ),
+        )
+        .pipe(
+          Effect.flatMap((response) => response.text),
+          Effect.timeout(Duration.seconds(3)),
+          Effect.ignore,
         ),
-      )
-      .pipe(
-        Effect.flatMap((response) => response.text),
-        Effect.timeout(Duration.seconds(3)),
-        Effect.ignore,
-      );
+    );
 
   const clearSessions = Effect.fn("PeerMcpClient.clearSessions")(function* (
     environmentId: EnvironmentId,
@@ -188,7 +190,9 @@ const make = Effect.gen(function* () {
         ),
       },
     ]);
-    yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
+    yield* Effect.uninterruptible(
+      Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true }),
+    );
   });
 
   yield* links.subscribeRefreshes.pipe(
@@ -259,6 +263,50 @@ const make = Effect.gen(function* () {
     return session;
   });
 
+  const openAndPublish = Effect.fn("PeerMcpClient.openAndPublish")(function* (
+    environmentId: EnvironmentId,
+    url: string,
+    token: string,
+    limitHeader: Record<string, string>,
+    sessionKey: string,
+    generation: number,
+    staleMessage: string,
+  ) {
+    // Once openSession has acquired a remote session, do not allow cancellation
+    // between that acquisition and publishing or closing it.
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const opened = yield* restore(openSession(environmentId, url, token, limitHeader));
+        const published = yield* Ref.modify(
+          sessionState,
+          (current): readonly [PublishResult, SessionState] => {
+            if ((current.generations.get(environmentId) ?? 0) !== generation) {
+              return [{ _tag: "stale" as const }, current];
+            }
+            const retained = current.sessions.get(sessionKey);
+            if (retained !== undefined) return [{ _tag: "duplicate" as const, retained }, current];
+            return [
+              { _tag: "published" as const, retained: opened },
+              {
+                generations: current.generations,
+                sessions: new Map(current.sessions).set(sessionKey, opened),
+              },
+            ];
+          },
+        );
+        if (published._tag === "stale") {
+          yield* closeSession(opened);
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: staleMessage,
+          });
+        }
+        if (published._tag === "duplicate") yield* closeSession(opened);
+        return published.retained;
+      }),
+    );
+  });
+
   const call: PeerMcpClient["Service"]["call"] = Effect.fn("PeerMcpClient.call")(function* (input) {
     const resolved = yield* links.resolve(input.environmentId).pipe(Effect.mapError(fromLinkError));
     const limitHeader = {
@@ -282,108 +330,40 @@ const make = Effect.gen(function* () {
         const state = yield* Ref.get(sessionState);
         const generation = state.generations.get(input.environmentId) ?? 0;
         const existing = state.sessions.get(sessionKey);
-        const sessionId =
-          existing?.sessionId ??
-          (yield* openSession(input.environmentId, resolved.url, resolved.token, limitHeader))
-            .sessionId;
+        let activeSession = existing;
         if (existing === undefined) {
-          const published = yield* Ref.modify(
-            sessionState,
-            (current): readonly [PublishResult, SessionState] => {
-              if ((current.generations.get(input.environmentId) ?? 0) !== generation) {
-                return [{ _tag: "stale" as const }, current];
-              }
-              const retained = current.sessions.get(sessionKey);
-              if (retained !== undefined)
-                return [{ _tag: "duplicate" as const, retained }, current];
-              return [
-                {
-                  _tag: "published" as const,
-                  retained: {
-                    environmentId: input.environmentId,
-                    url: resolved.url,
-                    token: resolved.token,
-                    sessionId,
-                  },
-                },
-                {
-                  generations: current.generations,
-                  sessions: new Map(current.sessions).set(sessionKey, {
-                    environmentId: input.environmentId,
-                    url: resolved.url,
-                    token: resolved.token,
-                    sessionId,
-                  }),
-                },
-              ];
-            },
-          );
-          if (published._tag === "stale") {
-            yield* closeSession({
-              environmentId: input.environmentId,
-              url: resolved.url,
-              token: resolved.token,
-              sessionId,
-            });
-            return yield* new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message: "The linked environment changed while its MCP session was opening.",
-            });
-          }
-          if (published._tag === "duplicate") {
-            yield* closeSession({
-              environmentId: input.environmentId,
-              url: resolved.url,
-              token: resolved.token,
-              sessionId,
-            });
-          }
-        }
-        let activeSessionId =
-          existing?.sessionId ??
-          (yield* Ref.get(sessionState)).sessions.get(sessionKey)?.sessionId ??
-          sessionId;
-        let response = yield* callOnce(activeSessionId);
-        if (response.status === 404) {
-          yield* response.text;
-          const renewed = yield* openSession(
+          activeSession = yield* openAndPublish(
             input.environmentId,
             resolved.url,
             resolved.token,
             limitHeader,
+            sessionKey,
+            generation,
+            "The linked environment changed while its MCP session was opening.",
           );
-          const published = yield* Ref.modify(
-            sessionState,
-            (current): readonly [PublishResult, SessionState] => {
-              if ((current.generations.get(input.environmentId) ?? 0) !== generation) {
-                return [{ _tag: "stale" as const }, current];
-              }
-              const retained = current.sessions.get(sessionKey);
-              if (retained !== undefined)
-                return [{ _tag: "duplicate" as const, retained }, current];
-              return [
-                { _tag: "published" as const, retained: renewed },
-                {
-                  generations: current.generations,
-                  sessions: new Map(current.sessions).set(sessionKey, {
-                    environmentId: input.environmentId,
-                    url: resolved.url,
-                    token: resolved.token,
-                    sessionId: renewed.sessionId,
-                  }),
-                },
-              ];
-            },
+        }
+        let activeSessionId =
+          activeSession?.sessionId ??
+          (yield* Ref.get(sessionState)).sessions.get(sessionKey)?.sessionId;
+        if (activeSessionId === undefined) {
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: "The linked environment has no usable MCP session.",
+          });
+        }
+        let response = yield* callOnce(activeSessionId);
+        if (response.status === 404) {
+          yield* response.text;
+          const renewed = yield* openAndPublish(
+            input.environmentId,
+            resolved.url,
+            resolved.token,
+            limitHeader,
+            sessionKey,
+            generation,
+            "The linked environment changed while its MCP session was reopening.",
           );
-          if (published._tag === "stale") {
-            yield* closeSession(renewed);
-            return yield* new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message: "The linked environment changed while its MCP session was reopening.",
-            });
-          }
-          if (published._tag === "duplicate") yield* closeSession(renewed);
-          activeSessionId = published.retained.sessionId;
+          activeSessionId = renewed.sessionId;
           response = yield* callOnce(activeSessionId);
         }
         if (response.status === 401) {
