@@ -7,6 +7,7 @@ import {
   type OrchestrationV2ThreadStreamItem,
   type OrchestrationV2TurnItem,
   type ThreadId as ThreadIdType,
+  EnvironmentId,
 } from "@t3tools/contracts";
 import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -22,7 +23,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient } from "effect/http";
-import { Atom } from "effect/reactivity";
+import { Atom, AtomRegistry } from "effect/reactivity";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
@@ -48,6 +49,7 @@ import {
   type ThreadHistoryMeta,
 } from "./threadHistoryMerge.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
+import { invalidatePeerLinkCache } from "./peerLinks.ts";
 import { makeThreadRequestsResolvedAnnouncer, pendingRuntimeRequestIds } from "./threadRequests.ts";
 import {
   EMPTY_ENVIRONMENT_THREAD_STATE,
@@ -193,6 +195,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   resumeCache?: ThreadResumeCache,
 ) {
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+  const atomRegistry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
   const cache = yield* Persistence.EnvironmentCacheStore;
   const snapshotLoader = yield* ThreadSnapshotLoader.ThreadSnapshotLoader;
   const historyController = yield* Effect.serviceOption(
@@ -501,6 +504,24 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     if (sequence === appliedSequence) return;
     yield* SubscriptionRef.set(lastSequence, sequence);
     if (fresh.length === 0) return;
+
+    // MCP unlink calls bypass the UI RPC command, so invalidate the peer-link
+    // list when their dynamic tool result reaches this client's thread stream.
+    if (Option.isSome(atomRegistry)) {
+      for (const item of fresh) {
+        if (item.event.type !== "turn-item.updated") continue;
+        const turnItem = item.event.payload;
+        if (turnItem.type !== "dynamic_tool" || turnItem.toolName !== "t3_environment_unlink") {
+          continue;
+        }
+        const input = turnItem.input;
+        if (typeof input !== "object" || input === null || !("environmentId" in input)) continue;
+        const environmentId = (input as { readonly environmentId?: unknown }).environmentId;
+        if (typeof environmentId === "string") {
+          invalidatePeerLinkCache(atomRegistry.value, EnvironmentId.make(environmentId));
+        }
+      }
+    }
 
     const waiting = yield* Ref.get(awaitingCompletion);
     // Apply against the latest projection/history in one update so a concurrent

@@ -610,7 +610,7 @@ export type OrchestratorMcpProviderCapability = typeof OrchestratorMcpProviderCa
 export const OrchestratorMcpEnvironmentLink = Schema.Struct({
   environmentId: EnvironmentId,
   label: Schema.String,
-  /** Whether it answered just now. An expired link must be linked again there. */
+  /** Whether it answered just now. Expired and revoked links must be paired again. */
   status: Schema.Literals(["reachable", "unreachable", "expired", "revoked"]),
   /** The most the linked environment lets this one's agents do there. */
   access: AuthMcpClientAccess,
@@ -824,7 +824,8 @@ export type OrchestratorMcpEnvironmentLinkResult = typeof OrchestratorMcpEnviron
 
 export const OrchestratorMcpEnvironmentUnlinkInput = Schema.Struct({
   environmentId: EnvironmentId.annotate({
-    description: "The linked environment to forget, from t3_environment_links.",
+    description:
+      "The linked environment to forget, from t3_environment_links. Forgetting it locally does not revoke the peer session.",
   }),
 });
 export type OrchestratorMcpEnvironmentUnlinkInput =

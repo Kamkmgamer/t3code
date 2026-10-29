@@ -25,7 +25,9 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassification";
 
@@ -87,7 +89,9 @@ export class PeerLinks extends Context.Service<
     readonly resolve: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<ResolvedPeerLink, PeerLinkError>;
-    /** Records the outcome of a call, so listing shows whether the peer answered last time. */
+    /** Authenticates the stored credential with the peer before reusing it. */
+    readonly probe: (environmentId: EnvironmentId) => Effect.Effect<PeerLink, PeerLinkError>;
+    /** Records the outcome of a call; revocation stays sticky for this secret generation. */
     readonly recordOutcome: (
       environmentId: EnvironmentId,
       secretName: string,
@@ -615,7 +619,7 @@ const make = Effect.gen(function* () {
         outcome.error === null
           ? sql`
               UPDATE peer_environment_links
-              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL, revoked = 0
+              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL
               WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
             `
           : sql`
@@ -628,6 +632,68 @@ const make = Effect.gen(function* () {
       Effect.ignoreCause({ log: true }),
     );
 
+  const probe: PeerLinks["Service"]["probe"] = Effect.fn("PeerLinks.probe")(
+    function* (environmentId) {
+      const resolved = yield* resolve(environmentId);
+      const response = yield* httpClient
+        .execute(
+          HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+            HttpClientRequest.setHeaders({
+              accept: "application/json, text/event-stream",
+              authorization: `Bearer ${resolved.token}`,
+            }),
+            HttpClientRequest.setBody(
+              HttpBody.jsonUnsafe({
+                jsonrpc: "2.0",
+                id: 0,
+                method: "initialize",
+                params: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: {},
+                  clientInfo: { name: "t3code-peer-probe", version: "1" },
+                },
+              }),
+            ),
+          ),
+        )
+        .pipe(
+          Effect.timeout(probeTimeout(resolved.url)),
+          Effect.mapError(
+            (cause) =>
+              new PeerLinkError({
+                reason: "unreachable",
+                message: `${resolved.link.label} stopped answering while checking its link.`,
+                cause,
+              }),
+          ),
+        );
+      if (response.status === 401) {
+        yield* recordOutcome(environmentId, resolved.secretName, {
+          error: "The linked environment rejected this link (HTTP 401).",
+          revoked: true,
+        });
+        return yield* new PeerLinkError({
+          reason: "revoked",
+          message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+        });
+      }
+      if (response.status === 403) {
+        return yield* new PeerLinkError({
+          reason: "unreachable",
+          message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
+        });
+      }
+      if (response.status !== 200) {
+        return yield* new PeerLinkError({
+          reason: "unreachable",
+          message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
+        });
+      }
+      yield* recordOutcome(environmentId, resolved.secretName, { error: null });
+      return resolved.link;
+    },
+  );
+
   return PeerLinks.of({
     enabled,
     link,
@@ -636,6 +702,7 @@ const make = Effect.gen(function* () {
     get,
     unlink,
     resolve,
+    probe,
     recordOutcome,
   });
 });

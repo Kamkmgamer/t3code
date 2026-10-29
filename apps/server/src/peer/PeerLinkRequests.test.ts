@@ -916,6 +916,28 @@ it.live("naming a machine that is already linked returns the link at once, with 
   ),
 );
 
+it.live("does not reuse a link whose token the peer revoked", () =>
+  withBoth((a, b) =>
+    Effect.gen(function* () {
+      yield* seedThread(a);
+      yield* linkTo(a.links, b);
+      const [session] = yield* b.linkedSessions;
+      yield* b.auth.revokeSession(session!.sessionId);
+
+      const asked = yield* a.call({ environmentId: box.environmentId });
+      expect(asked.structuredContent).toMatchObject({ status: "pending" });
+      const card = yield* pendingCard(a);
+      yield* a.requests.answer({
+        threadId,
+        turnItemId: card.id,
+        answer: { type: "use-existing", environmentId: box.environmentId },
+      });
+      expect(yield* cardOf(a)).toMatchObject({ linkStatus: "failed" });
+      expect((yield* outcomeMessages(a)).messages[0]!.text).toContain("revoked there");
+    }),
+  ),
+);
+
 it.live("a link that expired goes through the card, so the user can link it again", () =>
   withBoth((a, b) =>
     Effect.gen(function* () {

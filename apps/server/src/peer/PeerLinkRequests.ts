@@ -64,7 +64,7 @@ export class PeerLinkRequests extends Context.Service<
     /**
      * Shows a link card in the calling thread and returns at once. A retry
      * with the same clientRequestId and MCP credential returns the card's
-     * current outcome.
+     * current outcome. A remotely revoked link is not treated as usable.
      */
     readonly request: (
       scope: McpInvocationContext.McpInvocationScope,
@@ -73,7 +73,7 @@ export class PeerLinkRequests extends Context.Service<
     /**
      * Answers a pending card and tells the agent. Linking uses the pairing
      * code once; a link the other environment refuses closes the card as
-     * failed, with its reason.
+     * failed, with its reason. A revoked existing link must be paired again.
      */
     readonly answer: (
       input: PeerLinkRequestAnswerInput,
@@ -102,16 +102,19 @@ const make = Effect.gen(function* () {
         }),
       );
 
-  /**
-   * The stored link to `environmentId`, or nothing once it has expired: an
-   * expired link needs a new pairing code, which only the card asks for.
-   */
+  /** The stored link, after checking expiry, local revocation, and the peer's token. */
   const usableLink = (environmentId: EnvironmentId) =>
     Effect.all([peerLinks.get(environmentId), DateTime.now]).pipe(
-      Effect.map(([linked, now]) =>
-        Option.filter(
-          linked,
-          (link) => link.revoked !== true && DateTime.isGreaterThan(link.expiresAt, now),
+      Effect.flatMap(([linked, now]) =>
+        Option.match(
+          Option.filter(
+            linked,
+            (link) => link.revoked !== true && DateTime.isGreaterThan(link.expiresAt, now),
+          ),
+          {
+            onNone: () => Effect.succeedNone,
+            onSome: () => peerLinks.probe(environmentId).pipe(Effect.asSome),
+          },
         ),
       ),
     );
@@ -165,13 +168,13 @@ const make = Effect.gen(function* () {
             "Pass either environmentId or url, not both. Pass neither to let the user pick the machine.",
         });
       }
-      // A machine already linked needs no card: the agent can use it now.
+      // A machine already linked needs no card, but only after the peer accepts
+      // the stored token; a local row can outlive a remote revocation.
       if (input.environmentId !== undefined) {
         const linked = yield* usableLink(input.environmentId).pipe(
-          Effect.mapError(
-            (error) =>
-              new OrchestratorMcpFailure({ code: "orchestration_error", message: error.message }),
-          ),
+          // A failed probe means the local row cannot be reused. Leave the
+          // user a card so they can pair again or choose another environment.
+          Effect.catchTags({ PeerLinkError: () => Effect.succeedNone }),
         );
         if (Option.isSome(linked)) {
           return {
@@ -270,7 +273,7 @@ const make = Effect.gen(function* () {
                   new PeerLinkError({
                     reason: "unknown_link",
                     message:
-                      "That environment is no longer linked here, or its link expired. Link it again.",
+                      "That environment is no longer linked here, its link expired, or its token was revoked there. Link it again.",
                   }),
                 ),
               onSome: (linked) => Effect.succeed(linkedOutcome(linked)),

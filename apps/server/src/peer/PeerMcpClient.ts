@@ -29,7 +29,8 @@ export interface PeerCallLimits {
 /**
  * Calls a linked environment's T3 MCP tools as this environment's outside
  * agent. Each call carries the calling agent's limits in `T3-Mode-Limit`, so
- * the peer enforces the narrower of those and the link's own access.
+ * the peer enforces the narrower of those and the link's own access. A peer
+ * HTTP 401 marks that link generation revoked until a new link replaces it.
  */
 export class PeerMcpClient extends Context.Service<
   PeerMcpClient,
@@ -259,7 +260,8 @@ const make = Effect.gen(function* () {
         Effect.tap(() =>
           links.recordOutcome(input.environmentId, resolved.secretName, { error: null }),
         ),
-        // Recorded above with the transport's own message; the agent hears it plainly.
+        // A revoked link keeps its explicit 401 message; other failures retain
+        // the transport's own message for the agent.
         Effect.catchTags({
           HttpClientError: () =>
             Effect.fail(

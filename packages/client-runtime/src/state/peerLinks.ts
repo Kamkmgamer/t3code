@@ -1,11 +1,24 @@
-import { type PeerLinkSummary, WS_METHODS } from "@t3tools/contracts";
+import { type EnvironmentId, type PeerLinkSummary, WS_METHODS } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import { Atom } from "effect/reactivity";
+import { Atom, AtomRegistry } from "effect/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { createEnvironmentRpcCommand, createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
+
+export const peerLinkCacheInvalidation = Atom.family((environmentId: EnvironmentId) =>
+  Atom.make(0).pipe(Atom.withLabel(`peer-links:invalidated:${environmentId}`)),
+);
+
+/** Refreshes peer-link lists after an agent changes links through MCP. */
+export function invalidatePeerLinkCache(
+  registry: AtomRegistry.AtomRegistry,
+  environmentId: EnvironmentId,
+): void {
+  const signal = peerLinkCacheInvalidation(environmentId);
+  registry.set(signal, registry.get(signal) + 1);
+}
 
 export function createPeerLinkEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -15,6 +28,7 @@ export function createPeerLinkEnvironmentAtoms<R, E>(
     tag: WS_METHODS.peerLinksList,
     // Listing probes every linked environment, so a list stays fresh briefly.
     staleTimeMs: 10_000,
+    refreshTrigger: ({ environmentId }) => peerLinkCacheInvalidation(environmentId),
   });
   return {
     list,
@@ -55,9 +69,8 @@ export type PeerLinkHealth =
   | { readonly kind: "revoked" };
 
 /**
- * Listing only checks that the peer answers, so a link whose last call failed
- * (the peer revoked it, say) is `failing` with the recorded reason; the next
- * successful call clears it.
+ * Listing checks that the peer answers. A peer revocation is sticky until the
+ * link is replaced; other failures remain `failing` with their recorded reason.
  */
 export function peerLinkHealth(link: PeerLinkSummary, now: DateTime.Utc): PeerLinkHealth {
   if (link.status === "expired" || DateTime.isLessThanOrEqualTo(link.expiresAt, now)) {

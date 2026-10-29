@@ -385,6 +385,36 @@ it.effect("ignores an outcome from a link generation replaced while it was in fl
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("keeps a revocation sticky when outcomes race within one link generation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const current = yield* a.links.resolve(box.environmentId);
+
+      yield* Effect.all(
+        [
+          a.links.recordOutcome(box.environmentId, current.secretName, { error: null }),
+          a.links.recordOutcome(box.environmentId, current.secretName, {
+            error: "The peer rejected this token.",
+            revoked: true,
+          }),
+        ],
+        { concurrency: 2 },
+      );
+
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("tells the agent to link again once the peer revokes the link or it expires", () =>
   Effect.scoped(
     Effect.gen(function* () {

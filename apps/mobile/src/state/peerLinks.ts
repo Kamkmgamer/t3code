@@ -18,8 +18,8 @@ export const peerLinkEnvironment = createPeerLinkEnvironmentAtoms(connectionAtom
 
 /**
  * The machines `environmentId` links to, by name, while it offers links, and none otherwise.
- * Its agents can read threads there. Listing asks each linked machine whether it answers, so
- * every caller shares one briefly cached list.
+ * Its agents can read threads there. Revoked and expired links are omitted. Listing asks each
+ * linked machine whether it answers, so every caller shares one briefly cached list.
  */
 export function useLinkedEnvironments(
   environmentId: EnvironmentId | null,
