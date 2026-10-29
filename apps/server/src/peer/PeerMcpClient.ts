@@ -206,6 +206,12 @@ const make = Effect.gen(function* () {
     yield* Effect.forEach(current, closeSession, { concurrency: "unbounded", discard: true });
   });
 
+  const recordRevocation = (environmentId: EnvironmentId, secretName: string) =>
+    links.recordOutcome(environmentId, secretName, {
+      error: LINK_REVOKED_MESSAGE,
+      revoked: true,
+    });
+
   yield* links.subscribeRefreshes.pipe(
     Stream.runForEach((refresh) => clearSessions(refresh.environmentId)),
     Effect.forkScoped({ startImmediately: true }),
@@ -215,6 +221,7 @@ const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
     url: string,
     token: string,
+    secretName: string,
     limitHeader: Record<string, string>,
   ) {
     return yield* Effect.uninterruptibleMask((restore) =>
@@ -238,7 +245,10 @@ const make = Effect.gen(function* () {
         );
         const sessionId = initialized.headers["mcp-session-id"];
         if (initialized.status !== 200) {
-          if (initialized.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
+          if (initialized.status === 401) {
+            yield* recordRevocation(environmentId, secretName);
+            return yield* Effect.fail(new PeerMcpUnauthorized());
+          }
           yield* restore(drainResponse(initialized));
           if (initialized.status === 403) return yield* linkedEnvironmentsOffThere;
           return yield* new OrchestratorMcpFailure({
@@ -269,8 +279,12 @@ const make = Effect.gen(function* () {
             ),
           );
           if (notification.status < 200 || notification.status >= 300) {
+            if (notification.status === 401) {
+              yield* recordRevocation(environmentId, secretName);
+              yield* restore(drainResponse(notification));
+              return yield* Effect.fail(new PeerMcpUnauthorized());
+            }
             yield* restore(drainResponse(notification));
-            if (notification.status === 401) return yield* Effect.fail(new PeerMcpUnauthorized());
             if (notification.status === 403) return yield* linkedEnvironmentsOffThere;
             return yield* new OrchestratorMcpFailure({
               code: "orchestration_error",
@@ -290,6 +304,7 @@ const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
     url: string,
     token: string,
+    secretName: string,
     limitHeader: Record<string, string>,
     sessionKey: string,
     generation: number,
@@ -299,7 +314,9 @@ const make = Effect.gen(function* () {
     // between that acquisition and publishing or closing it.
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const opened = yield* restore(openSession(environmentId, url, token, limitHeader));
+        const opened = yield* restore(
+          openSession(environmentId, url, token, secretName, limitHeader),
+        );
         const published = yield* Ref.modify(
           sessionState,
           (current): readonly [PublishResult, SessionState] => {
@@ -359,6 +376,7 @@ const make = Effect.gen(function* () {
             input.environmentId,
             resolved.url,
             resolved.token,
+            resolved.secretName,
             limitHeader,
             sessionKey,
             generation,
@@ -389,6 +407,7 @@ const make = Effect.gen(function* () {
             input.environmentId,
             resolved.url,
             resolved.token,
+            resolved.secretName,
             limitHeader,
             sessionKey,
             generation,
@@ -398,16 +417,23 @@ const make = Effect.gen(function* () {
           response = yield* callOnce(activeSessionId);
         }
         if (response.status === 401) {
-          yield* drainResponse(response);
-          const session = yield* Ref.modify(sessionState, (current) => {
-            const session = current.sessions.get(sessionKey);
-            if (session?.sessionId !== activeSessionId) return [undefined, current];
-            const next = new Map(current.sessions);
-            next.delete(sessionKey);
-            return [session, { generations: current.generations, sessions: next }];
-          });
-          if (session !== undefined) yield* closeSession(session);
-          return yield* Effect.fail(new PeerMcpUnauthorized());
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* recordRevocation(input.environmentId, resolved.secretName);
+              const closeActiveSession = Effect.gen(function* () {
+                const session = yield* Ref.modify(sessionState, (current) => {
+                  const session = current.sessions.get(sessionKey);
+                  if (session?.sessionId !== activeSessionId) return [undefined, current];
+                  const next = new Map(current.sessions);
+                  next.delete(sessionKey);
+                  return [session, { generations: current.generations, sessions: next }];
+                });
+                if (session !== undefined) yield* closeSession(session);
+              });
+              yield* restore(drainResponse(response)).pipe(Effect.ensuring(closeActiveSession));
+              return yield* Effect.fail(new PeerMcpUnauthorized());
+            }),
+          );
         }
         if (response.status === 403) {
           yield* drainResponse(response);

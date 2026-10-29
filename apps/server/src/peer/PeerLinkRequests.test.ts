@@ -28,6 +28,7 @@ import * as HttpServer from "effect/http/HttpServer";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
@@ -916,6 +917,32 @@ it.live("naming a machine that is already linked returns the link at once, with 
   ),
 );
 
+it.live("does not return linked when the peer is unlinked during its success probe", () =>
+  withBoth((a, b) =>
+    Effect.gen(function* () {
+      yield* seedThread(a);
+      yield* linkTo(a.links, b);
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpNotificationGate, gate);
+      const pending = yield* a
+        .call({ environmentId: box.environmentId })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const verify = Effect.gen(function* () {
+        yield* Deferred.await(b.mcpNotificationStarted);
+        expect(yield* a.links.unlink(box.environmentId)).toBe(true);
+        yield* Deferred.succeed(gate, undefined);
+
+        expect((yield* Fiber.join(pending)).structuredContent).toMatchObject({ status: "pending" });
+        expect(yield* cardOf(a)).toMatchObject({ linkStatus: "pending" });
+      });
+      yield* Effect.ensuring(
+        verify,
+        Deferred.succeed(gate, undefined).pipe(Effect.andThen(Fiber.await(pending)), Effect.asVoid),
+      );
+    }),
+  ),
+);
+
 it.live("does not reuse a link whose token the peer revoked", () =>
   withBoth((a, b) =>
     Effect.gen(function* () {
@@ -998,4 +1025,50 @@ it.live(
         expect((yield* b.linkedSessions).length).toBe(1);
       }),
     ),
+);
+
+it.live("fails use-existing when the link is replaced during its success probe", () =>
+  withBoth((a, b) =>
+    Effect.gen(function* () {
+      yield* seedThread(a);
+      yield* a.call({ environmentId: box.environmentId });
+      const card = yield* pendingCard(a);
+      yield* linkTo(a.links, b, "read-only");
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpNotificationGate, gate);
+      const answer = yield* a.requests
+        .answer({
+          threadId,
+          turnItemId: card.id,
+          answer: { type: "use-existing", environmentId: box.environmentId },
+        })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const verify = Effect.gen(function* () {
+        yield* Deferred.await(b.mcpNotificationStarted);
+
+        yield* Ref.set(b.descriptor, {
+          ...box,
+          label: "Replacement box",
+        });
+        yield* a.links.link({
+          url: b.url,
+          pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+          access: "auto",
+        });
+        yield* Deferred.succeed(gate, undefined);
+        yield* Fiber.join(answer);
+
+        expect(yield* cardOf(a)).toMatchObject({ linkStatus: "failed" });
+        expect(Option.getOrUndefined(yield* a.links.get(box.environmentId))).toMatchObject({
+          label: "Replacement box",
+          access: "auto",
+          revoked: false,
+        });
+      });
+      yield* Effect.ensuring(
+        verify,
+        Deferred.succeed(gate, undefined).pipe(Effect.andThen(Fiber.await(answer)), Effect.asVoid),
+      );
+    }),
+  ),
 );

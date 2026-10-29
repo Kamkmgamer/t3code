@@ -822,22 +822,17 @@ const make = Effect.gen(function* () {
                   ),
                 );
                 if (notification.status === 401) {
+                  yield* recordOutcome(environmentId, resolved.secretName, {
+                    error: "The linked environment rejected this link (HTTP 401).",
+                    revoked: true,
+                  });
                   yield* restore(
                     notification.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
                   );
-                  return yield* recordOutcome(environmentId, resolved.secretName, {
-                    error: "The linked environment rejected this link (HTTP 401).",
-                    revoked: true,
-                  }).pipe(
-                    Effect.andThen(
-                      Effect.fail(
-                        new PeerLinkError({
-                          reason: "revoked",
-                          message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
-                        }),
-                      ),
-                    ),
-                  );
+                  return yield* new PeerLinkError({
+                    reason: "revoked",
+                    message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+                  });
                 }
                 if (notification.status < 200 || notification.status >= 300) {
                   yield* restore(
@@ -854,7 +849,33 @@ const make = Effect.gen(function* () {
             terminate(),
           );
           yield* restore(recordOutcome(environmentId, resolved.secretName, { error: null }));
-          return resolved.link;
+          const currentRow = yield* readRow(environmentId);
+          if (Option.isNone(currentRow)) {
+            return yield* new PeerLinkError({
+              reason: "unknown_link",
+              message: "The link was removed while it was being checked.",
+            });
+          }
+          if (currentRow.value.secret_name !== resolved.secretName) {
+            return yield* new PeerLinkError({
+              reason: "unknown_link",
+              message: "The link changed while it was being checked. Try again.",
+            });
+          }
+          const currentLink = yield* toLink(currentRow.value);
+          if (currentRow.value.revoked === 1) {
+            return yield* new PeerLinkError({
+              reason: "revoked",
+              message: `The link to ${currentLink.label} was revoked there. Link it again with a new pairing code from ${currentLink.label}.`,
+            });
+          }
+          if (DateTime.isLessThanOrEqualTo(currentLink.expiresAt, yield* DateTime.now)) {
+            return yield* new PeerLinkError({
+              reason: "expired",
+              message: `The link to ${currentLink.label} expired. Link it again with a new pairing code from ${currentLink.label}.`,
+            });
+          }
+          return currentLink;
         }),
       );
     },
