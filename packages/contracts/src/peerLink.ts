@@ -1,7 +1,21 @@
 import * as Schema from "effect/Schema";
 
 import { AuthMcpClientAccess } from "./auth.ts";
-import { EnvironmentId, ThreadId, TrimmedNonEmptyString, TurnItemId } from "./baseSchemas.ts";
+import {
+  EnvironmentId,
+  NonNegativeInt,
+  ThreadId,
+  TrimmedNonEmptyString,
+  TurnItemId,
+} from "./baseSchemas.ts";
+
+/** A link generation changed; consumers can invalidate only that peer's sessions. */
+export const PeerLinkRefresh = Schema.Struct({
+  revision: NonNegativeInt,
+  environmentId: EnvironmentId,
+  secretName: Schema.NullOr(Schema.String),
+});
+export type PeerLinkRefresh = typeof PeerLinkRefresh.Type;
 
 /**
  * A link from this environment to another one (the peer). This environment

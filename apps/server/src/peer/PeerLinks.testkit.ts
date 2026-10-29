@@ -54,6 +54,13 @@ export const descriptorOf = (
   },
 });
 
+export interface ProbeTracker {
+  readonly inFlight: Ref.Ref<number>;
+  readonly maxInFlight: Ref.Ref<number>;
+  readonly gate: Ref.Ref<Deferred.Deferred<void> | null>;
+  readonly reached: Deferred.Deferred<void>;
+}
+
 /**
  * The environment a link points at, as it runs: its descriptor, MCP OAuth,
  * and `/mcp` with `tools` behind the real client authenticator, on a real
@@ -63,6 +70,7 @@ export const descriptorOf = (
 export const servePeer = <E, R>(
   initial: ExecutionEnvironmentDescriptor,
   tools: Layer.Layer<never, E, R>,
+  probeTracker?: ProbeTracker,
 ) =>
   Effect.gen(function* () {
     const descriptor = yield* Ref.make(initial);
@@ -71,6 +79,8 @@ export const servePeer = <E, R>(
     const requests = yield* Ref.make<ReadonlyArray<string>>([]);
     const mcpGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     const mcpStarted = yield* Deferred.make<void>();
+    const mcpInitializeCount = yield* Ref.make(0);
+    const mcpConcurrentStarted = yield* Deferred.make<void>();
     const mcpNotificationGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
     const mcpNotificationStarted = yield* Deferred.make<void>();
     const mcpNotificationStatus = yield* Ref.make<number | null>(null);
@@ -92,8 +102,16 @@ export const servePeer = <E, R>(
       (httpEffect) =>
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
-          if (request.url.startsWith("/.well-known/t3/environment")) {
+          const isDescriptor = request.url.startsWith("/.well-known/t3/environment");
+          if (isDescriptor) {
             yield* Ref.update(probes, (count) => count + 1);
+            if (probeTracker !== undefined) {
+              const inFlight = yield* Ref.updateAndGet(probeTracker.inFlight, (count) => count + 1);
+              yield* Ref.update(probeTracker.maxInFlight, (max) => Math.max(max, inFlight));
+              if (inFlight >= 4) yield* Deferred.succeed(probeTracker.reached, undefined);
+              const gate = yield* Ref.get(probeTracker.gate);
+              if (gate !== null) yield* Deferred.await(gate);
+            }
           }
           const authorization = request.headers.authorization;
           yield* Ref.update(requests, (seen) => [...seen, `${request.method} ${request.url}`]);
@@ -102,6 +120,10 @@ export const servePeer = <E, R>(
           }
           if (request.url.startsWith("/mcp") && request.method === "POST") {
             const notification = request.headers["mcp-session-id"] !== undefined;
+            if (!notification) {
+              const count = yield* Ref.updateAndGet(mcpInitializeCount, (value) => value + 1);
+              if (count >= 2) yield* Deferred.succeed(mcpConcurrentStarted, undefined);
+            }
             const gate = yield* Ref.get(notification ? mcpNotificationGate : mcpGate);
             if (gate !== null) {
               yield* Deferred.succeed(
@@ -115,7 +137,12 @@ export const servePeer = <E, R>(
               if (status !== null) return HttpServerResponse.empty({ status });
             }
           }
-          return yield* httpEffect;
+          return yield* Effect.ensuring(
+            httpEffect,
+            isDescriptor && probeTracker !== undefined
+              ? Ref.update(probeTracker.inFlight, (count) => count - 1)
+              : Effect.void,
+          );
         }),
       { global: true },
     );
@@ -162,6 +189,8 @@ export const servePeer = <E, R>(
       requests,
       mcpGate,
       mcpStarted,
+      mcpInitializeCount,
+      mcpConcurrentStarted,
       mcpNotificationGate,
       mcpNotificationStarted,
       mcpNotificationStatus,

@@ -2,6 +2,7 @@ import { type EnvironmentId, type PeerLinkSummary, WS_METHODS } from "@t3tools/c
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { Atom, AtomRegistry } from "effect/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -30,6 +31,7 @@ export function createPeerLinkEnvironmentAtoms<R, E>(
   const refreshes = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
     label: "environment-data:peer-links:refreshes",
     tag: WS_METHODS.peerLinksSubscribeRefreshes,
+    transform: (stream) => stream.pipe(Stream.map((refresh) => refresh.revision)),
   });
   const refreshTrigger = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => {

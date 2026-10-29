@@ -20,6 +20,7 @@ import {
   PeerLink,
   PeerLinkCreateInput,
   PeerLinkError,
+  PeerLinkRefresh,
   PeerLinkRemoveInput,
   PeerLinkRemoveResult,
   PeerLinkRequestAnswerInput,
@@ -800,7 +801,7 @@ const WsPeerLinksAnswerRequestRpc = Rpc.make(WS_METHODS.peerLinksAnswerRequest, 
 
 const WsPeerLinksSubscribeRefreshesRpc = Rpc.make(WS_METHODS.peerLinksSubscribeRefreshes, {
   payload: Schema.Struct({}),
-  success: NonNegativeInt,
+  success: PeerLinkRefresh,
   error: EnvironmentAuthorizationError,
   stream: true,
 });

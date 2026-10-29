@@ -31,6 +31,8 @@ import * as ServerSettings from "../serverSettings.ts";
 import {
   descriptorOf,
   layerLinkingEnvironment,
+  linkTo,
+  type ProbeTracker,
   servePeer,
   type ServedPeer,
 } from "./PeerLinks.testkit.ts";
@@ -89,8 +91,12 @@ const probeHandlers = McpToolAccess.toLayer(ProbeToolkit, {
   ),
 });
 
-const serveB = (descriptor: ExecutionEnvironmentDescriptor) =>
-  servePeer(descriptor, McpHttpServer.toolkitRegistration(ProbeToolkit, probeHandlers));
+const serveB = (descriptor: ExecutionEnvironmentDescriptor, probeTracker?: ProbeTracker) =>
+  servePeer(
+    descriptor,
+    McpHttpServer.toolkitRegistration(ProbeToolkit, probeHandlers),
+    probeTracker,
+  );
 
 /** Environment A, which links to B. */
 const makeA = (
@@ -109,25 +115,33 @@ const makeA = (
 
 const laptop = descriptorOf("environment-laptop", "Laptop");
 const box = descriptorOf("environment-box", "Box");
-const probe = (
+const callPeer = (
   a: Effect.Success<ReturnType<typeof makeA>>,
+  environmentId: ExecutionEnvironmentDescriptor["environmentId"],
   limits: PeerMcpClient.PeerCallLimits = { runtimeMode: "full-access", interactionMode: "default" },
   tool = "probe",
 ) =>
   a.peer.call({
-    environmentId: box.environmentId,
+    environmentId,
     tool,
     arguments: {},
     limits,
     success: Probe,
   });
+const probe = (
+  a: Effect.Success<ReturnType<typeof makeA>>,
+  limits: PeerMcpClient.PeerCallLimits = { runtimeMode: "full-access", interactionMode: "default" },
+  tool = "probe",
+) => callPeer(a, box.environmentId, limits, tool);
 
 const linkedSessions = (b: ServedPeer) => b.linkedSessions;
 
 /** Another environment on a socket of its own, answering as `descriptor`. */
-const serveApart = (descriptor: ExecutionEnvironmentDescriptor) =>
+const serveApart = (descriptor: ExecutionEnvironmentDescriptor, probeTracker?: ProbeTracker) =>
   Layer.build(Layer.fresh(NodeHttpServer.layerTest)).pipe(
-    Effect.flatMap((server) => serveB(descriptor).pipe(Effect.provideContext(server))),
+    Effect.flatMap((server) =>
+      serveB(descriptor, probeTracker).pipe(Effect.provideContext(server)),
+    ),
   );
 
 it.effect("links with a pairing code, and the peer holds its agents to the limits they carry", () =>
@@ -450,16 +464,23 @@ it.effect("does not publish an MCP session opened across an unlink refresh", () 
       });
       const gate = yield* Deferred.make<void>();
       yield* Ref.set(b.mcpGate, gate);
-      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
-        Effect.forkScoped({ startImmediately: true }),
-      );
+      const refresh = yield* Stream.runHead(
+        a.links.subscribeRefreshes.pipe(
+          Stream.filter((event) => event.environmentId === box.environmentId),
+        ),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
       const pending = yield* probe(a).pipe(
         Effect.flip,
         Effect.forkScoped({ startImmediately: true }),
       );
       yield* Deferred.await(b.mcpStarted);
       expect(yield* a.links.unlink(box.environmentId)).toBe(true);
-      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+      expect(
+        Option.map(yield* Fiber.join(refresh), ({ revision, environmentId }) => ({
+          revision,
+          environmentId,
+        })),
+      ).toEqual(Option.some({ revision: 1, environmentId: box.environmentId }));
       yield* Deferred.succeed(gate, undefined);
 
       const failed = yield* Fiber.join(pending);
@@ -576,11 +597,126 @@ it.effect("publishes link refreshes for unlink operations", () =>
         pairingCode: (yield* b.auth.issuePairingCredential()).credential,
         access: "auto",
       });
-      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
-        Effect.forkScoped({ startImmediately: true }),
-      );
+      const refresh = yield* Stream.runHead(
+        a.links.subscribeRefreshes.pipe(
+          Stream.filter((event) => event.environmentId === box.environmentId),
+        ),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
       expect(yield* a.links.unlink(box.environmentId)).toBe(true);
-      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+      expect(
+        Option.map(yield* Fiber.join(refresh), ({ revision, environmentId }) => ({
+          revision,
+          environmentId,
+        })),
+      ).toEqual(Option.some({ revision: 1, environmentId: box.environmentId }));
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("refreshing one peer keeps another peer session usable", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const cDescriptor = descriptorOf("environment-chair", "Chair");
+      const c = yield* serveApart(cDescriptor);
+      const a = yield* makeA(laptop);
+      yield* linkTo(a.links, b);
+      const cPairing = yield* c.auth.issuePairingCredential();
+      yield* a.links.link({ url: c.url, pairingCode: cPairing.credential, access: "auto" });
+      yield* probe(a);
+      yield* callPeer(a, cDescriptor.environmentId);
+
+      const refresh = yield* Stream.runHead(
+        a.links.subscribeRefreshes.pipe(
+          Stream.filter((event) => event.environmentId === box.environmentId),
+        ),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
+      expect(yield* a.links.unlink(box.environmentId)).toBe(true);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      expect(Option.map(yield* Fiber.join(refresh), ({ environmentId }) => environmentId)).toEqual(
+        Option.some(box.environmentId),
+      );
+
+      // C's cached session remains available while B's old one is closed.
+      const cRequestsBefore = (yield* Ref.get(c.requests)).length;
+      yield* callPeer(a, cDescriptor.environmentId);
+      expect((yield* Ref.get(c.requests)).length).toBeGreaterThan(cRequestsBefore);
+      expect((yield* Ref.get(c.requests)).some((request) => request.startsWith("DELETE "))).toBe(
+        false,
+      );
+      expect((yield* Ref.get(b.requests)).map((request) => request.split(" ")[0])).toContain(
+        "DELETE",
+      );
+      yield* probe(a);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("closes duplicate sessions opened by concurrent cache misses", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpGate, gate);
+      const first = yield* probe(a).pipe(Effect.forkScoped({ startImmediately: true }));
+      const second = yield* probe(a).pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(b.mcpConcurrentStarted);
+      yield* Deferred.succeed(gate, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+
+      expect((yield* linkedSessions(b)).length).toBe(1);
+      expect(
+        (yield* Ref.get(b.requests)).filter((request) => request.startsWith("DELETE ")),
+      ).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("bounds concurrent linked-environment status probes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const tracker: ProbeTracker = {
+        inFlight: yield* Ref.make(0),
+        maxInFlight: yield* Ref.make(0),
+        gate: yield* Ref.make<Deferred.Deferred<void> | null>(null),
+        reached: yield* Deferred.make<void>(),
+      };
+      const peers = yield* Effect.all(
+        [
+          serveApart(descriptorOf("environment-peer-0", "Peer 0"), tracker),
+          serveApart(descriptorOf("environment-peer-1", "Peer 1"), tracker),
+          serveApart(descriptorOf("environment-peer-2", "Peer 2"), tracker),
+          serveApart(descriptorOf("environment-peer-3", "Peer 3"), tracker),
+          serveApart(descriptorOf("environment-peer-4", "Peer 4"), tracker),
+          serveApart(descriptorOf("environment-peer-5", "Peer 5"), tracker),
+        ],
+        { concurrency: 6 },
+      );
+      const a = yield* makeA(laptop);
+      for (const peer of peers) yield* linkTo(a.links, peer);
+      yield* Ref.set(tracker.maxInFlight, 0);
+      expect(yield* Ref.get(tracker.inFlight)).toBe(0);
+
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(tracker.gate, gate);
+      const listing = yield* a.links.list.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(tracker.reached);
+      const maxInFlight = yield* Ref.get(tracker.maxInFlight);
+      expect(maxInFlight).toBe(4);
+      expect(maxInFlight).toBeLessThanOrEqual(4);
+      yield* Deferred.succeed(gate, undefined);
+      expect((yield* Fiber.join(listing)).length).toBe(6);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -647,12 +783,19 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       ]);
 
       const [session] = yield* linkedSessions(b);
-      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(
-        Effect.forkScoped({ startImmediately: true }),
-      );
+      const refresh = yield* Stream.runHead(
+        a.links.subscribeRefreshes.pipe(
+          Stream.filter((event) => event.environmentId === box.environmentId),
+        ),
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
       yield* b.auth.revokeSession(session!.sessionId);
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["revoked"]);
-      expect(yield* Fiber.join(refresh)).toEqual(Option.some(1));
+      expect(
+        Option.map(yield* Fiber.join(refresh), ({ revision, environmentId }) => ({
+          revision,
+          environmentId,
+        })),
+      ).toEqual(Option.some({ revision: 1, environmentId: box.environmentId }));
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");

@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   type ExecutionEnvironmentCapabilities,
   MCP_PEER_LINK_SOFTWARE_ID,
+  type PeerLinkRefresh,
   type PeerLink,
   type PeerLinkCreateInput,
   PeerLinkError,
@@ -45,6 +46,7 @@ const LINK_REDIRECT_URI = "http://127.0.0.1/t3code-peer-link";
  */
 const probeTimeout = (origin: string) =>
   isLocalLoopbackHost(new URL(origin).hostname) ? Duration.seconds(3) : Duration.seconds(10);
+const listProbeConcurrency = 4;
 
 /** A usable link: where to reach the peer and the token to send there. */
 export interface ResolvedPeerLink {
@@ -82,7 +84,7 @@ export class PeerLinks extends Context.Service<
     >;
     readonly list: Effect.Effect<ReadonlyArray<PeerLinkSummary>, PeerLinkError>;
     /** Emits after a link changes, including changes made directly by an agent. */
-    readonly subscribeRefreshes: Stream.Stream<number>;
+    readonly subscribeRefreshes: Stream.Stream<PeerLinkRefresh>;
     /** The stored link, without asking the peer whether it answers. */
     readonly get: (
       environmentId: EnvironmentId,
@@ -178,8 +180,21 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
-  const refreshRevision = yield* SubscriptionRef.make(0);
-  const notifyRefresh = SubscriptionRef.update(refreshRevision, (revision) => revision + 1);
+  const refreshState = yield* SubscriptionRef.make<{
+    readonly revision: number;
+    readonly environmentId: EnvironmentId | null;
+    readonly secretName: string | null;
+  }>({ revision: 0, environmentId: null, secretName: null });
+  const notifyRefresh = Effect.fn("PeerLinks.notifyRefresh")(function* (
+    environmentId: EnvironmentId,
+    secretName: string | null,
+  ) {
+    yield* SubscriptionRef.update(refreshState, (state) => ({
+      revision: state.revision + 1,
+      environmentId,
+      secretName,
+    }));
+  });
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -491,7 +506,7 @@ const make = Effect.gen(function* () {
     if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
       yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
     }
-    yield* notifyRefresh;
+    yield* notifyRefresh(linked.environmentId, secretName);
     return linked;
   });
 
@@ -562,7 +577,7 @@ const make = Effect.gen(function* () {
         statusOf(row, link, now).pipe(
           Effect.map(Option.map(({ link: currentLink, status }) => ({ ...currentLink, status }))),
         ),
-      { concurrency: "unbounded" },
+      { concurrency: listProbeConcurrency },
     );
     return current.flatMap((value) => (Option.isSome(value) ? [value.value] : []));
   });
@@ -586,7 +601,9 @@ const make = Effect.gen(function* () {
       for (const row of deleted) {
         yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
       }
-      if (deleted.length > 0) yield* notifyRefresh;
+      if (deleted.length > 0) {
+        for (const row of deleted) yield* notifyRefresh(environmentId, row.secret_name);
+      }
       return deleted.length > 0;
     },
   );
@@ -679,7 +696,9 @@ const make = Effect.gen(function* () {
                     AND revoked = 0
                   RETURNING revoked
                 `;
-          if (outcome.revoked === true && updated.length > 0) yield* notifyRefresh;
+          if (outcome.revoked === true && updated.length > 0) {
+            yield* notifyRefresh(environmentId, secretName);
+          }
         }),
       ),
       Effect.asVoid,
@@ -815,8 +834,16 @@ const make = Effect.gen(function* () {
     link,
     describe: describeUrl,
     list,
-    subscribeRefreshes: SubscriptionRef.changes(refreshRevision).pipe(
-      Stream.filter((revision) => revision > 0),
+    subscribeRefreshes: SubscriptionRef.changes(refreshState).pipe(
+      Stream.filterMap((state) =>
+        state.environmentId === null || state.revision === 0
+          ? Result.failVoid
+          : Result.succeed({
+              revision: state.revision,
+              environmentId: state.environmentId,
+              secretName: state.secretName,
+            } satisfies PeerLinkRefresh),
+      ),
     ),
     get,
     unlink,
