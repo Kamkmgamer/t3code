@@ -34,6 +34,7 @@ export type AuthSessionClientMetadataRecord = typeof AuthSessionClientMetadataRe
 export const AuthSessionRecord = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
+  peerLink: Schema.Boolean,
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthSessionClientMetadataRecord,
@@ -47,6 +48,7 @@ export type AuthSessionRecord = typeof AuthSessionRecord.Type;
 export const CreateAuthSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
+  peerLink: Schema.optionalKey(Schema.Boolean),
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthSessionClientMetadataRecord,
@@ -125,6 +127,7 @@ export class AuthSessionRepository extends Context.Service<
 const AuthSessionDbRow = Schema.Struct({
   sessionId: AuthSessionId,
   subject: Schema.String,
+  peerLink: Schema.Number,
   scopes: Schema.fromJsonString(AuthEnvironmentScopes),
   method: ServerAuthSessionMethod,
   clientLabel: Schema.NullOr(Schema.String),
@@ -142,6 +145,7 @@ const AuthSessionDbRow = Schema.Struct({
 const AuthSessionRawDbRow = Schema.Struct({
   sessionId: Schema.String,
   subject: Schema.Unknown,
+  peerLink: Schema.Unknown,
   scopes: Schema.Unknown,
   method: Schema.Unknown,
   clientLabel: Schema.Unknown,
@@ -162,6 +166,7 @@ function toAuthSessionRecord(row: typeof AuthSessionDbRow.Type): AuthSessionReco
   return {
     sessionId: row.sessionId,
     subject: row.subject,
+    peerLink: row.peerLink === 1,
     scopes: row.scopes,
     method: row.method,
     client: {
@@ -206,6 +211,7 @@ export const make = Effect.gen(function* () {
         INSERT INTO auth_sessions (
           session_id,
           subject,
+          peer_link,
           scopes,
           method,
           client_label,
@@ -221,6 +227,7 @@ export const make = Effect.gen(function* () {
         VALUES (
           ${input.sessionId},
           ${input.subject},
+          ${input.peerLink === true ? 1 : 0},
           ${JSON.stringify(input.scopes)},
           ${input.method},
           ${input.client.label},
@@ -247,6 +254,7 @@ export const make = Effect.gen(function* () {
         SELECT
           session_id AS "sessionId",
           subject AS "subject",
+          peer_link AS "peerLink",
           scopes AS "scopes",
           method AS "method",
           client_label AS "clientLabel",
@@ -291,6 +299,7 @@ export const make = Effect.gen(function* () {
         SELECT
           session_id AS "sessionId",
           subject AS "subject",
+          peer_link AS "peerLink",
           scopes AS "scopes",
           method AS "method",
           client_label AS "clientLabel",

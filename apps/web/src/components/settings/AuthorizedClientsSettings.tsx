@@ -53,6 +53,7 @@ import {
 } from "~/environments/primary";
 import { readEnvironmentScope } from "~/state/session";
 import { usePrimaryEnvironmentId } from "~/state/environments";
+import { requestConfirmDialog } from "~/confirmDialog";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 import {
@@ -516,6 +517,17 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
     clientSession.client.label ??
     ([clientSession.client.os, clientSession.client.browser].filter(Boolean).join(" · ") ||
       clientSession.subject);
+  const linkedEnvironmentLabel = clientSession.client.label ?? "the linked environment";
+  const handleRevoke = async () => {
+    if (clientSession.peerLink) {
+      const confirmed = await requestConfirmDialog(
+        `Revoke ${linkedEnvironmentLabel}'s linked-environment token? This breaks its link to this environment until it is linked again.`,
+        { variant: "destructive" },
+      );
+      if (!confirmed) return;
+    }
+    onRevokeSession(clientSession.sessionId);
+  };
 
   return (
     <div className={ITEM_ROW_CLASSNAME}>
@@ -528,6 +540,11 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
               pingClassName={isLive ? "bg-success/60 duration-2000" : null}
             />
             <h3 className="text-sm font-medium text-foreground">{primaryLabel}</h3>
+            {clientSession.peerLink ? (
+              <span className="rounded-md border border-primary/30 bg-primary/10 px-1 py-0.5 text-3xs text-primary">
+                Linked environment
+              </span>
+            ) : null}
             {clientSession.current ? (
               <span className="text-3xs text-muted-foreground/80 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
                 This device
@@ -550,7 +567,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
               size="xs"
               variant="destructive-outline"
               disabled={!canRevoke || revokingClientSessionId === clientSession.sessionId}
-              onClick={() => void onRevokeSession(clientSession.sessionId)}
+              onClick={() => void handleRevoke()}
             >
               {revokingClientSessionId === clientSession.sessionId ? "Revoking…" : "Revoke"}
             </Button>

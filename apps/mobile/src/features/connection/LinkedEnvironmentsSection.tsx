@@ -48,15 +48,17 @@ export function LinkedEnvironmentsSection(props: {
         {links.data.links.map((link) => {
           const health = peerLinkHealth(link, now);
           const status =
-            health.kind === "expired"
-              ? "Expired. Link it again with a new pairing code."
-              : health.kind === "unreachable"
-                ? (health.detail ?? "Not answering right now.")
-                : health.kind === "failing"
-                  ? health.detail
-                  : health.expiresInDays !== null
-                    ? `Expires in ${health.expiresInDays} ${health.expiresInDays === 1 ? "day" : "days"}`
-                    : "Reachable";
+            health.kind === "revoked"
+              ? "Revoked. Link it again with a new pairing code."
+              : health.kind === "expired"
+                ? "Expired. Link it again with a new pairing code."
+                : health.kind === "unreachable"
+                  ? (health.detail ?? "Not answering right now.")
+                  : health.kind === "failing"
+                    ? health.detail
+                    : health.expiresInDays !== null
+                      ? `Expires in ${health.expiresInDays} ${health.expiresInDays === 1 ? "day" : "days"}`
+                      : "Reachable";
           return (
             <View key={link.environmentId} className="gap-0.5 p-4">
               <Text className="text-base font-t3-bold text-foreground">{link.label}</Text>

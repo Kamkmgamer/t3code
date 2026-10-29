@@ -115,15 +115,17 @@ function LinkedEnvironmentRow({
     }
   };
   const status =
-    health.kind === "expired"
-      ? "Expired. Link it again with a new pairing code."
-      : health.kind === "unreachable"
-        ? (health.detail ?? "Not answering right now.")
-        : health.kind === "failing"
-          ? health.detail
-          : health.expiresInDays !== null
-            ? `Expires in ${health.expiresInDays} ${health.expiresInDays === 1 ? "day" : "days"}. Link it again to renew.`
-            : "Reachable";
+    health.kind === "revoked"
+      ? "Revoked. Link it again with a new pairing code."
+      : health.kind === "expired"
+        ? "Expired. Link it again with a new pairing code."
+        : health.kind === "unreachable"
+          ? (health.detail ?? "Not answering right now.")
+          : health.kind === "failing"
+            ? health.detail
+            : health.expiresInDays !== null
+              ? `Expires in ${health.expiresInDays} ${health.expiresInDays === 1 ? "day" : "days"}. Link it again to renew.`
+              : "Reachable";
   return (
     <div className={ITEM_ROW_CLASSNAME}>
       <div className={ITEM_ROW_INNER_CLASSNAME}>
@@ -136,7 +138,9 @@ function LinkedEnvironmentRow({
                   ? health.expiresInDays === null
                     ? "bg-success"
                     : "bg-warning"
-                  : health.kind === "expired" || health.kind === "failing"
+                  : health.kind === "expired" ||
+                      health.kind === "failing" ||
+                      health.kind === "revoked"
                     ? "bg-destructive"
                     : "bg-muted-foreground/30"
               }

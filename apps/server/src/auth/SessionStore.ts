@@ -563,6 +563,7 @@ const make = Effect.gen(function* () {
       toAuthClientSession({
         sessionId: row.value.sessionId,
         subject: row.value.subject,
+        ...(row.value.peerLink ? { peerLink: true } : {}),
         scopes: row.value.scopes,
         method: row.value.method,
         client: toClientMetadata(row.value.client),
@@ -679,6 +680,7 @@ const make = Effect.gen(function* () {
       const sessionRecord = {
         sessionId,
         subject: claims.sub,
+        peerLink: input?.peerLink === true,
         scopes: claims.scopes,
         method: claims.method,
         client: {
@@ -720,6 +722,7 @@ const make = Effect.gen(function* () {
         toAuthClientSession({
           sessionId,
           subject: claims.sub,
+          ...(input?.peerLink === true ? { peerLink: true } : {}),
           scopes: claims.scopes,
           method: claims.method,
           client,
@@ -966,6 +969,7 @@ const make = Effect.gen(function* () {
         toAuthClientSession({
           sessionId: row.sessionId,
           subject: row.subject,
+          ...(row.peerLink ? { peerLink: true } : {}),
           scopes: row.scopes,
           method: row.method,
           client: toClientMetadata(row.client),

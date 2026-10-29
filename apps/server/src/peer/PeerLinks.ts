@@ -88,7 +88,7 @@ export class PeerLinks extends Context.Service<
     /** Records the outcome of a call, so listing shows whether the peer answered last time. */
     readonly recordOutcome: (
       environmentId: EnvironmentId,
-      outcome: { readonly error: string | null },
+      outcome: { readonly error: string | null; readonly revoked?: boolean },
     ) => Effect.Effect<void>;
   }
 >()("t3/peer/PeerLinks") {}
@@ -104,6 +104,7 @@ interface PeerLinkRow {
   readonly last_reached_at: string | null;
   readonly last_error: string | null;
   readonly fenced: number;
+  readonly revoked: number;
 }
 
 const decodeUrls = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(Schema.String)));
@@ -208,6 +209,7 @@ const make = Effect.gen(function* () {
       expiresAt: DateTime.makeUnsafe(row.fenced === 1 ? row.expires_at : row.linked_at),
       lastReachedAt: row.last_reached_at === null ? null : DateTime.makeUnsafe(row.last_reached_at),
       lastError: row.last_error,
+      revoked: row.revoked === 1,
     } satisfies PeerLink;
   }, Effect.catch(failStorage));
 
@@ -451,11 +453,11 @@ const make = Effect.gen(function* () {
       yield* sql`
         INSERT INTO peer_environment_links (
           environment_id, secret_name, label, urls_json, access, linked_at, expires_at,
-          last_reached_at, last_error, fenced
+          last_reached_at, last_error, fenced, revoked
         ) VALUES (
           ${linked.environmentId}, ${secretName}, ${linked.label}, ${urlsJson}, ${linked.access},
           ${DateTime.formatIso(linked.linkedAt)}, ${DateTime.formatIso(linked.expiresAt)},
-          ${DateTime.formatIso(now)}, NULL, 1
+          ${DateTime.formatIso(now)}, NULL, 1, 0
         )
         ON CONFLICT (environment_id) DO UPDATE SET
           secret_name = excluded.secret_name,
@@ -466,7 +468,8 @@ const make = Effect.gen(function* () {
           linked_at = excluded.linked_at,
           expires_at = excluded.expires_at,
           last_reached_at = excluded.last_reached_at,
-          last_error = NULL
+          last_error = NULL,
+          revoked = 0
       `.pipe(Effect.catch(failStorage));
       return previous;
     }).pipe(Effect.onError(() => secrets.remove(secretName).pipe(Effect.ignore)));
@@ -486,19 +489,21 @@ const make = Effect.gen(function* () {
     );
 
   const statusOf = (link: PeerLink, now: DateTime.Utc) =>
-    DateTime.isLessThanOrEqualTo(link.expiresAt, now)
-      ? Effect.succeed<PeerLinkStatus>("expired")
-      : Effect.findFirst(link.urls, (url) =>
-          describe(url).pipe(
-            Effect.map(
-              (found) => Option.isSome(found) && found.value.environmentId === link.environmentId,
+    link.revoked === true
+      ? Effect.succeed<PeerLinkStatus>("revoked")
+      : DateTime.isLessThanOrEqualTo(link.expiresAt, now)
+        ? Effect.succeed<PeerLinkStatus>("expired")
+        : Effect.findFirst(link.urls, (url) =>
+            describe(url).pipe(
+              Effect.map(
+                (found) => Option.isSome(found) && found.value.environmentId === link.environmentId,
+              ),
             ),
-          ),
-        ).pipe(
-          Effect.map((answered): PeerLinkStatus =>
-            Option.isSome(answered) ? "reachable" : "unreachable",
-          ),
-        );
+          ).pipe(
+            Effect.map((answered): PeerLinkStatus =>
+              Option.isSome(answered) ? "reachable" : "unreachable",
+            ),
+          );
 
   const list: PeerLinks["Service"]["list"] = Effect.gen(function* () {
     const links = yield* Effect.forEach(yield* readRows, toLink);
@@ -543,6 +548,12 @@ const make = Effect.gen(function* () {
         });
       }
       const link = yield* toLink(row.value);
+      if (row.value.revoked === 1) {
+        return yield* new PeerLinkError({
+          reason: "revoked",
+          message: `The link to ${link.label} was revoked there. Link it again with a new pairing code from ${link.label}.`,
+        });
+      }
       if (DateTime.isLessThanOrEqualTo(link.expiresAt, yield* DateTime.now)) {
         return yield* new PeerLinkError({
           reason: "expired",
@@ -592,11 +603,12 @@ const make = Effect.gen(function* () {
         outcome.error === null
           ? sql`
               UPDATE peer_environment_links
-              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL
+              SET last_reached_at = ${DateTime.formatIso(now)}, last_error = NULL, revoked = 0
               WHERE environment_id = ${environmentId}
             `
           : sql`
-              UPDATE peer_environment_links SET last_error = ${outcome.error}
+              UPDATE peer_environment_links
+              SET last_error = ${outcome.error}${outcome.revoked === true ? sql`, revoked = 1` : sql``}
               WHERE environment_id = ${environmentId}
             `,
       ),

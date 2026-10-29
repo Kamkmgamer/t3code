@@ -19,11 +19,12 @@ export const PeerLink = Schema.Struct({
   expiresAt: Schema.DateTimeUtc,
   lastReachedAt: Schema.NullOr(Schema.DateTimeUtc),
   lastError: Schema.NullOr(Schema.String),
+  revoked: Schema.optionalKey(Schema.Boolean),
 });
 export type PeerLink = typeof PeerLink.Type;
 
 /** Whether a link can be used now, as worked out when it is listed. */
-export const PeerLinkStatus = Schema.Literals(["reachable", "unreachable", "expired"]);
+export const PeerLinkStatus = Schema.Literals(["reachable", "unreachable", "expired", "revoked"]);
 export type PeerLinkStatus = typeof PeerLinkStatus.Type;
 
 export const PeerLinkSummary = Schema.Struct({
@@ -65,6 +66,7 @@ export class PeerLinkError extends Schema.TaggedError<PeerLinkError>()("PeerLink
     "self",
     "pairing_rejected",
     "expired",
+    "revoked",
     "unknown_link",
     "storage",
     "disabled",

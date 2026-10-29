@@ -51,7 +51,8 @@ export type PeerLinkHealth =
   | { readonly kind: "reachable"; readonly expiresInDays: number | null }
   | { readonly kind: "unreachable"; readonly detail: string | null }
   | { readonly kind: "failing"; readonly detail: string }
-  | { readonly kind: "expired" };
+  | { readonly kind: "expired" }
+  | { readonly kind: "revoked" };
 
 /**
  * Listing only checks that the peer answers, so a link whose last call failed
@@ -62,6 +63,7 @@ export function peerLinkHealth(link: PeerLinkSummary, now: DateTime.Utc): PeerLi
   if (link.status === "expired" || DateTime.isLessThanOrEqualTo(link.expiresAt, now)) {
     return { kind: "expired" };
   }
+  if (link.status === "revoked") return { kind: "revoked" };
   if (link.status === "unreachable") return { kind: "unreachable", detail: link.lastError };
   if (link.lastError !== null) return { kind: "failing", detail: link.lastError };
   const days = Math.ceil(Duration.toDays(DateTime.distance(now, link.expiresAt)));

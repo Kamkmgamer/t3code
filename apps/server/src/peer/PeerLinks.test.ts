@@ -370,6 +370,7 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["revoked"]);
 
       yield* a.links.link({
         url: b.url,

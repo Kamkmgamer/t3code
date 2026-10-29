@@ -109,7 +109,10 @@ const make = Effect.gen(function* () {
   const usableLink = (environmentId: EnvironmentId) =>
     Effect.all([peerLinks.get(environmentId), DateTime.now]).pipe(
       Effect.map(([linked, now]) =>
-        Option.filter(linked, (link) => DateTime.isGreaterThan(link.expiresAt, now)),
+        Option.filter(
+          linked,
+          (link) => link.revoked !== true && DateTime.isGreaterThan(link.expiresAt, now),
+        ),
       ),
     );
 

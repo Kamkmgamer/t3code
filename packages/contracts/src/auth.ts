@@ -285,6 +285,8 @@ export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
+  /** This session belongs to another T3 environment's linked-environment link. */
+  peerLink: Schema.optionalKey(Schema.Boolean),
   ...authScopeResponseFields,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,

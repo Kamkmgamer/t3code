@@ -63,6 +63,7 @@ const decodeFailure = Schema.decodeUnknownOption(
     Schema.Struct({ code: OrchestratorMcpFailure.fields.code, message: Schema.String }),
   ),
 );
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 /** A peer link problem, as the agent that asked hears it. */
 const fromLinkError = (error: PeerLinkError) =>
@@ -70,7 +71,9 @@ const fromLinkError = (error: PeerLinkError) =>
     code:
       error.reason === "unknown_link"
         ? "invalid_request"
-        : error.reason === "expired" || error.reason === "incompatible"
+        : error.reason === "expired" ||
+            error.reason === "revoked" ||
+            error.reason === "incompatible"
           ? "capability_denied"
           : "orchestration_error",
     message: error.message,
@@ -240,7 +243,14 @@ const make = Effect.gen(function* () {
     (effect, input) =>
       effect.pipe(
         Effect.tapError((error) =>
-          links.recordOutcome(input.environmentId, { error: error.message }),
+          links.recordOutcome(input.environmentId, {
+            error: error.message,
+            ...(isOrchestratorMcpFailure(error) &&
+            error.code === "capability_denied" &&
+            error.message.includes("revoked")
+              ? { revoked: true }
+              : {}),
+          }),
         ),
         Effect.tap(() => links.recordOutcome(input.environmentId, { error: null })),
         // Recorded above with the transport's own message; the agent hears it plainly.

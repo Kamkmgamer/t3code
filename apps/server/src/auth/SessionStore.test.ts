@@ -329,6 +329,15 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
     }).pipe(Effect.provide(layerSessionStore())),
   );
 
+  it.effect("keeps linked-environment sessions marked in the authorized-client list", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const linked = yield* sessions.issue({ subject: "mcp-client", peerLink: true });
+      const listed = yield* sessions.listActive();
+      expect(listed.find((session) => session.sessionId === linked.sessionId)?.peerLink).toBe(true);
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
   it.effect("keeps the previous desktop session valid when replacement fails", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

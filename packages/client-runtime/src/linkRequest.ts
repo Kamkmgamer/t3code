@@ -38,7 +38,7 @@ export function linkedEnvironmentNames(input: {
   );
   return new Map(
     input.links.flatMap((link) =>
-      link.status === "expired"
+      link.status === "expired" || link.status === "revoked"
         ? []
         : [[link.environmentId, names.get(link.environmentId) ?? link.label] as const],
     ),
@@ -88,7 +88,9 @@ export function linkableMachines(input: {
   readonly connect: ReadonlyMap<string, RelayDiscoveredEnvironment>;
 }): ReadonlyArray<LinkableMachine> {
   const linkedIds = new Set(
-    input.links.flatMap((link) => (link.status === "expired" ? [] : [link.environmentId])),
+    input.links.flatMap((link) =>
+      link.status === "expired" || link.status === "revoked" ? [] : [link.environmentId],
+    ),
   );
   const saved = input.environments
     .filter((environment) => environment.environmentId !== input.threadEnvironmentId)
