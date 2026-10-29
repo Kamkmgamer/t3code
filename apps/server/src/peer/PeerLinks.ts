@@ -22,11 +22,13 @@ import * as Base64Url from "effect/encoding/Base64Url";
 import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Result from "effect/Result";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
-import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
@@ -86,6 +88,13 @@ export class PeerLinks extends Context.Service<
     readonly list: Effect.Effect<ReadonlyArray<PeerLinkSummary>, PeerLinkError>;
     /** Emits after a link changes, including changes made directly by an agent. */
     readonly subscribeRefreshes: Stream.Stream<PeerLinkRefresh>;
+    /** Current stored generations used to reconcile bounded refresh notifications. */
+    readonly currentGenerations: Effect.Effect<ReadonlyArray<PeerLinkGeneration>, PeerLinkError>;
+    /** Whether an operation still owns the current usable generation of a link. */
+    readonly isCurrentGeneration: (
+      environmentId: EnvironmentId,
+      secretName: string,
+    ) => Effect.Effect<boolean, PeerLinkError>;
     /** The stored link, without asking the peer whether it answers. */
     readonly get: (
       environmentId: EnvironmentId,
@@ -119,6 +128,13 @@ interface PeerLinkRow {
   readonly last_error: string | null;
   readonly fenced: number;
   readonly revoked: number;
+}
+
+interface PeerLinkGeneration {
+  readonly environmentId: EnvironmentId;
+  readonly secretName: string;
+  readonly revoked: boolean;
+  readonly expiresAt: DateTime.Utc;
 }
 
 const decodeUrls = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(Schema.String)));
@@ -181,20 +197,19 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
-  const refreshState = yield* SubscriptionRef.make<{
-    readonly revision: number;
-    readonly environmentId: EnvironmentId | null;
-    readonly secretName: string | null;
-  }>({ revision: 0, environmentId: null, secretName: null });
+  const refreshChanges = yield* PubSub.sliding<PeerLinkRefresh>({ capacity: 1, replay: 1 });
+  const refreshRevision = yield* Ref.make(0);
+  const refreshLock = yield* Semaphore.make(1);
   const notifyRefresh = Effect.fn("PeerLinks.notifyRefresh")(function* (
     environmentId: EnvironmentId,
     secretName: string | null,
   ) {
-    yield* SubscriptionRef.update(refreshState, (state) => ({
-      revision: state.revision + 1,
-      environmentId,
-      secretName,
-    }));
+    yield* refreshLock.withPermit(
+      Effect.gen(function* () {
+        const revision = yield* Ref.updateAndGet(refreshRevision, (current) => current + 1);
+        yield* PubSub.publish(refreshChanges, { revision, environmentId, secretName });
+      }),
+    );
   });
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
@@ -252,6 +267,32 @@ const make = Effect.gen(function* () {
     `.pipe(
       Effect.catch(failStorage),
       Effect.map((rows) => Option.fromNullishOr(rows[0])),
+    );
+
+  const generationOfRow = (row: PeerLinkRow): PeerLinkGeneration => ({
+    environmentId: EnvironmentId.make(row.environment_id),
+    secretName: row.secret_name,
+    revoked: row.revoked === 1,
+    expiresAt: DateTime.makeUnsafe(row.fenced === 1 ? row.expires_at : row.linked_at),
+  });
+  const currentGenerations = readRows.pipe(Effect.map((rows) => rows.map(generationOfRow)));
+  const isCurrentGeneration: PeerLinks["Service"]["isCurrentGeneration"] = (
+    environmentId,
+    secretName,
+  ) =>
+    readRow(environmentId).pipe(
+      Effect.flatMap((row) => {
+        if (Option.isNone(row)) return Effect.succeed(false);
+        const generation = generationOfRow(row.value);
+        return DateTime.now.pipe(
+          Effect.map(
+            (now) =>
+              generation.secretName === secretName &&
+              !generation.revoked &&
+              !DateTime.isLessThanOrEqualTo(generation.expiresAt, now),
+          ),
+        );
+      }),
     );
 
   /** Signs in to the peer's `/mcp` with a pairing code: register, decide, exchange. */
@@ -555,7 +596,7 @@ const make = Effect.gen(function* () {
                             ? ("expired" as const)
                             : currentRow.secret_name === row.secret_name
                               ? probedStatus
-                              : ("reachable" as const),
+                              : ("unreachable" as const),
                     }),
                   ),
                 ),
@@ -724,7 +765,8 @@ const make = Effect.gen(function* () {
           ),
         );
       const readResponse = (response: HttpClientResponse.HttpClientResponse) =>
-        response.text.pipe(
+        response.stream.pipe(
+          Stream.runDrain,
           Effect.timeout(probeTimeout(resolved.url)),
           Effect.mapError(
             (cause) =>
@@ -735,6 +777,8 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
+      const discardResponse = (response: HttpClientResponse.HttpClientResponse) =>
+        response.stream.pipe(Stream.runDrain, Effect.timeout(Duration.seconds(3)), Effect.ignore);
       const initRequest = HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
         HttpClientRequest.setHeaders({
           accept: "application/json, text/event-stream",
@@ -762,20 +806,21 @@ const make = Effect.gen(function* () {
               error: "The linked environment rejected this link (HTTP 401).",
               revoked: true,
             });
+            yield* restore(discardResponse(response));
             return yield* new PeerLinkError({
               reason: "revoked",
               message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
             });
           }
           if (response.status === 403) {
-            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
+            yield* restore(discardResponse(response));
             return yield* new PeerLinkError({
               reason: "unreachable",
               message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
             });
           }
           if (response.status !== 200) {
-            yield* restore(response.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore));
+            yield* restore(discardResponse(response));
             return yield* new PeerLinkError({
               reason: "unreachable",
               message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
@@ -783,6 +828,7 @@ const make = Effect.gen(function* () {
           }
           const sessionId = response.headers["mcp-session-id"];
           if (sessionId === undefined) {
+            yield* restore(discardResponse(response));
             return yield* new PeerLinkError({
               reason: "unreachable",
               message: `${resolved.link.label} did not return an MCP session for the link check.`,
@@ -801,7 +847,7 @@ const make = Effect.gen(function* () {
                   HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
                     HttpClientRequest.setHeaders(sessionHeaders),
                   ),
-                ).pipe(Effect.flatMap((deleted) => deleted.text)),
+                ).pipe(Effect.flatMap(discardResponse)),
               ).pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
             );
           yield* Effect.ensuring(
@@ -826,18 +872,14 @@ const make = Effect.gen(function* () {
                     error: "The linked environment rejected this link (HTTP 401).",
                     revoked: true,
                   });
-                  yield* restore(
-                    notification.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
-                  );
+                  yield* restore(discardResponse(notification));
                   return yield* new PeerLinkError({
                     reason: "revoked",
                     message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
                   });
                 }
                 if (notification.status < 200 || notification.status >= 300) {
-                  yield* restore(
-                    notification.text.pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
-                  );
+                  yield* restore(discardResponse(notification));
                   return yield* new PeerLinkError({
                     reason: "unreachable",
                     message: `${resolved.link.label} refused the link check (HTTP ${notification.status}).`,
@@ -886,17 +928,9 @@ const make = Effect.gen(function* () {
     link,
     describe: describeUrl,
     list,
-    subscribeRefreshes: SubscriptionRef.changes(refreshState).pipe(
-      Stream.filterMap((state) =>
-        state.environmentId === null || state.revision === 0
-          ? Result.failVoid
-          : Result.succeed({
-              revision: state.revision,
-              environmentId: state.environmentId,
-              secretName: state.secretName,
-            } satisfies PeerLinkRefresh),
-      ),
-    ),
+    subscribeRefreshes: Stream.fromPubSub(refreshChanges),
+    currentGenerations,
+    isCurrentGeneration,
     get,
     unlink,
     resolve,

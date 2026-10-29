@@ -1,5 +1,9 @@
 import { NodeHttpServer } from "@effect/platform-node";
-import { type ExecutionEnvironmentDescriptor, OrchestratorMcpFailure } from "@t3tools/contracts";
+import {
+  type ExecutionEnvironmentDescriptor,
+  type PeerLinkRefresh,
+  OrchestratorMcpFailure,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -142,6 +146,20 @@ const probe = (
 
 const linkedSessions = (b: ServedPeer) => b.linkedSessions;
 
+type TestSignal<A> = {
+  readonly promise: Promise<A>;
+  readonly wait: Effect.Effect<A>;
+  readonly resolve: (value: A) => void;
+};
+
+const makeTestSignal = <A>(): TestSignal<A> => {
+  let resolve!: (value: A) => void;
+  const promise = new Promise<A>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, wait: Effect.promise(() => promise), resolve };
+};
+
 const controlledInitializeResponse = (
   active: Ref.Ref<boolean>,
   observed: Deferred.Deferred<{ readonly status: number; readonly sessionId: string | undefined }>,
@@ -163,11 +181,87 @@ const controlledInitializeResponse = (
       }
       const sessionId = response.headers["mcp-session-id"];
       yield* Deferred.succeed(observed, { status: response.status, sessionId });
-      Object.defineProperty(response, "text", {
+      Object.defineProperty(response, "stream", {
         configurable: true,
-        value: Effect.suspend(() => body(request, response)),
+        value: Stream.fromEffect(
+          Effect.suspend(() => body(request, response)).pipe(
+            Effect.map((text) => new TextEncoder().encode(text)),
+          ),
+        ),
       });
       return response;
+    }),
+  );
+
+const trackedInitializeResponse = (
+  active: Ref.Ref<boolean>,
+  observed: Deferred.Deferred<{ readonly status: number; readonly sessionId: string | undefined }>,
+  bodyStarted: TestSignal<void>,
+  bodyCancelled: TestSignal<void>,
+  bodyFailed: TestSignal<void>,
+  bodyReleased: TestSignal<void>,
+  behavior: "stall" | "fail",
+) =>
+  layerHttpClientResponseTransform((request, response) =>
+    Effect.gen(function* () {
+      if (
+        !(yield* Ref.get(active)) ||
+        request.url.endsWith("/mcp") === false ||
+        request.method !== "POST" ||
+        request.headers["mcp-session-id"] !== undefined ||
+        response.status !== 401
+      ) {
+        return response;
+      }
+      yield* Deferred.succeed(observed, {
+        status: response.status,
+        sessionId: response.headers["mcp-session-id"],
+      });
+      let releasePull = () => {};
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          bodyStarted.resolve(undefined);
+          if (behavior === "fail") {
+            controller.error(new Error("controlled body failure"));
+            bodyFailed.resolve(undefined);
+            bodyReleased.resolve(undefined);
+            return;
+          }
+          return new Promise<void>((resolve) => {
+            releasePull = resolve;
+          });
+        },
+        cancel() {
+          releasePull();
+          bodyCancelled.resolve(undefined);
+          bodyReleased.resolve(undefined);
+        },
+      });
+      return HttpClientResponse.fromWeb(request, new Response(body, { status: response.status }));
+    }),
+  );
+
+const delayedDeleteResponse = (
+  active: Ref.Ref<boolean>,
+  bodyStarted: TestSignal<void>,
+  bodyGate: TestSignal<void>,
+) =>
+  layerHttpClientResponseTransform((request, response) =>
+    Effect.gen(function* () {
+      if (
+        !(yield* Ref.get(active)) ||
+        request.url.endsWith("/mcp") === false ||
+        request.method !== "DELETE"
+      ) {
+        return response;
+      }
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          bodyStarted.resolve(undefined);
+          return bodyGate.promise.then(() => controller.close());
+        },
+      });
+      return HttpClientResponse.fromWeb(request, new Response(body, { status: 200 }));
     }),
   );
 
@@ -193,12 +287,12 @@ const controlledSessionResponse = (
         status: response.status,
         sessionId: request.headers["mcp-session-id"],
       });
-      Object.defineProperty(response, "text", {
+      Object.defineProperty(response, "stream", {
         configurable: true,
-        value: Effect.suspend(() =>
+        value: Stream.fromEffect(
           Deferred.succeed(bodyStarted, undefined).pipe(
             Effect.andThen(Deferred.await(bodyGate)),
-            Effect.as(""),
+            Effect.as(new TextEncoder().encode("")),
           ),
         ),
       });
@@ -228,6 +322,88 @@ const callPeerTool = (a: Effect.Success<ReturnType<typeof makeA>>) =>
     limits: { runtimeMode: "full-access", interactionMode: "default" },
     success: Probe,
   });
+
+const verifyInitialize401BodyOwnership = (
+  path: "probe" | "tool",
+  behavior: "stall" | "fail" | "interrupted",
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const observed = yield* Deferred.make<{
+        readonly status: number;
+        readonly sessionId: string | undefined;
+      }>();
+      const bodyStarted = makeTestSignal<void>();
+      const bodyCancelled = makeTestSignal<void>();
+      const bodyFailed = makeTestSignal<void>();
+      const bodyReleased = makeTestSignal<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        trackedInitializeResponse(
+          active,
+          observed,
+          bodyStarted,
+          bodyCancelled,
+          bodyFailed,
+          bodyReleased,
+          behavior === "fail" ? "fail" : "stall",
+        ),
+      );
+      yield* linkTo(a.links, b);
+      yield* Ref.set(b.initializeResponse, { status: 401 });
+      yield* Ref.set(active, true);
+
+      const request =
+        path === "probe"
+          ? a.links.probe(box.environmentId).pipe(
+              Effect.asVoid,
+              Effect.mapError(() => "failed" as const),
+            )
+          : callPeerTool(a).pipe(
+              Effect.asVoid,
+              Effect.mapError(() => "failed" as const),
+            );
+      const pending = yield* Effect.exit(request).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      expect(yield* Deferred.await(observed)).toEqual({ status: 401, sessionId: undefined });
+
+      const phase = yield* Effect.raceFirst(
+        bodyStarted.wait.pipe(Effect.as("body" as const)),
+        Fiber.join(pending).pipe(Effect.as("finished" as const)),
+      );
+      expect(phase).toBe("body");
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+
+      if (behavior === "fail") {
+        expect(Exit.isFailure(yield* Fiber.join(pending))).toBe(true);
+        yield* bodyFailed.wait;
+      } else {
+        expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+          Option.some(true),
+        );
+
+        if (behavior === "stall") {
+          yield* TestClock.adjust(Duration.seconds(3));
+          expect(Exit.isFailure(yield* Fiber.join(pending))).toBe(true);
+        } else {
+          yield* Fiber.interrupt(pending);
+        }
+        if (behavior === "interrupted") yield* bodyCancelled.wait;
+      }
+
+      yield* bodyReleased.wait;
+
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest));
 
 /** Another environment on a socket of its own, answering as `descriptor`. */
 const serveApart = (descriptor: ExecutionEnvironmentDescriptor, probeTracker?: ProbeTracker) =>
@@ -697,12 +873,22 @@ it.effect("revokes a probe link when HTTP 401 has a failed body", () =>
       const headers = yield* Deferred.await(observed);
       expect(failed.reason).toBe("revoked");
       expect(headers).toEqual({ status: 401, sessionId: undefined });
-      expect(yield* Ref.get(bodyStarted)).toBe(false);
+      expect(yield* Ref.get(bodyStarted)).toBe(true);
       expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
         Option.some(true),
       );
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["stall", "fail", "interrupted"] as const)(
+  "releases a tool initialize-401 body that %s",
+  (behavior) => verifyInitialize401BodyOwnership("tool", behavior),
+);
+
+it.effect.each(["stall", "fail", "interrupted"] as const)(
+  "releases a probe initialize-401 body that %s",
+  (behavior) => verifyInitialize401BodyOwnership("probe", behavior),
 );
 
 it.effect("revokes a tool link when HTTP 401 has a pending initialize body", () =>
@@ -739,7 +925,7 @@ it.effect("revokes a tool link when HTTP 401 has a pending initialize body", () 
       const failed = yield* Fiber.join(pending);
       expect(Exit.isFailure(failed)).toBe(true);
       expect(headers).toEqual({ status: 401, sessionId: undefined });
-      expect(yield* Ref.get(bodyStarted)).toBe(false);
+      expect(yield* Ref.get(bodyStarted)).toBe(true);
       expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
         Option.some(true),
       );
@@ -1234,12 +1420,12 @@ it.effect("preserves a replacement session when a held 404 request finishes late
           }
           yield* Ref.set(b.sessionResponse, null);
           yield* Deferred.succeed(observed, request.headers["mcp-session-id"]!);
-          Object.defineProperty(response, "text", {
+          Object.defineProperty(response, "stream", {
             configurable: true,
-            value: Effect.suspend(() =>
+            value: Stream.fromEffect(
               Deferred.succeed(bodyStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(bodyGate)),
-                Effect.as(""),
+                Effect.as(new TextEncoder().encode("")),
               ),
             ),
           });
@@ -1408,6 +1594,134 @@ it.effect("bounds concurrent linked-environment status probes", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("coalesces a slow refresh subscriber to the latest bounded event", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const a = yield* makeA(laptop);
+      const boxPeer = yield* serveB(box);
+      const chairDescriptor = descriptorOf("environment-chair", "Chair");
+      const deskDescriptor = descriptorOf("environment-desk", "Desk");
+      const chairPeer = yield* serveApart(chairDescriptor);
+      const deskPeer = yield* serveApart(deskDescriptor);
+      const received = yield* Ref.make<ReadonlyArray<PeerLinkRefresh>>([]);
+      const firstDelivered = yield* Deferred.make<void>();
+      const secondDelivered = yield* Deferred.make<void>();
+      const latestDelivered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+
+      yield* a.links.subscribeRefreshes.pipe(
+        Stream.runForEach((event) =>
+          Ref.updateAndGet(received, (events) => [...events, event]).pipe(
+            Effect.flatMap((events) => {
+              if (events.length === 1) return Deferred.succeed(firstDelivered, undefined);
+              if (events.length === 2) {
+                return Deferred.succeed(secondDelivered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                );
+              }
+              return event.environmentId === deskDescriptor.environmentId
+                ? Deferred.succeed(latestDelivered, undefined)
+                : Effect.void;
+            }),
+          ),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* linkTo(a.links, boxPeer);
+      yield* Deferred.await(firstDelivered);
+      const boxLink = yield* a.links.resolve(box.environmentId);
+      yield* a.links.recordOutcome(box.environmentId, boxLink.secretName, {
+        error: "The peer rejected this link.",
+        revoked: true,
+      });
+      yield* Deferred.await(secondDelivered);
+      yield* linkTo(a.links, chairPeer);
+      yield* linkTo(a.links, deskPeer);
+      const expectedLatestRevision = (yield* Ref.get(received)).at(-1)!.revision + 2;
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(latestDelivered);
+
+      expect(
+        (yield* Ref.get(received)).map(({ environmentId, revision }) => ({
+          environmentId,
+          revision,
+        })),
+      ).toEqual([
+        { environmentId: box.environmentId, revision: 1 },
+        { environmentId: box.environmentId, revision: 2 },
+        { environmentId: deskDescriptor.environmentId, revision: expectedLatestRevision },
+      ]);
+      expect(yield* Ref.get(received)).toHaveLength(3);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("reconciles coalesced link generations without closing unaffected sessions", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const active = yield* Ref.make(false);
+      const deleteBodyStarted = makeTestSignal<void>();
+      const deleteBodyGate = makeTestSignal<void>();
+      const anchorDescriptor = descriptorOf("environment-anchor", "Anchor");
+      const chairDescriptor = descriptorOf("environment-chair", "Chair");
+      const deskDescriptor = descriptorOf("environment-desk", "Desk");
+      const anchor = yield* serveApart(anchorDescriptor);
+      const boxPeer = yield* serveB(box);
+      const chair = yield* serveApart(chairDescriptor);
+      const desk = yield* serveApart(deskDescriptor);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        delayedDeleteResponse(active, deleteBodyStarted, deleteBodyGate),
+      );
+
+      yield* linkTo(a.links, anchor);
+      yield* linkTo(a.links, boxPeer);
+      yield* linkTo(a.links, chair);
+      yield* linkTo(a.links, desk);
+      yield* callPeer(a, anchorDescriptor.environmentId);
+      yield* callPeer(a, box.environmentId);
+      yield* callPeer(a, chairDescriptor.environmentId);
+      yield* callPeer(a, deskDescriptor.environmentId);
+      yield* Ref.set(active, true);
+
+      const anchorLink = yield* a.links.resolve(anchorDescriptor.environmentId);
+      yield* a.links.recordOutcome(anchorDescriptor.environmentId, anchorLink.secretName, {
+        error: "The anchor link changed.",
+        revoked: true,
+      });
+      yield* deleteBodyStarted.wait;
+
+      const boxLink = yield* a.links.resolve(box.environmentId);
+      const deskLink = yield* a.links.resolve(deskDescriptor.environmentId);
+      yield* a.links.recordOutcome(box.environmentId, boxLink.secretName, {
+        error: "The peer rejected this link.",
+        revoked: true,
+      });
+      yield* a.links.recordOutcome(deskDescriptor.environmentId, deskLink.secretName, {
+        error: "The peer rejected this link.",
+        revoked: true,
+      });
+      deleteBodyGate.resolve(undefined);
+
+      yield* Deferred.await(boxPeer.mcpDeleteStarted);
+      yield* Deferred.await(desk.mcpDeleteStarted);
+      yield* callPeer(a, chairDescriptor.environmentId);
+
+      expect(yield* Ref.get(chair.mcpInitializeCount)).toBe(1);
+      expect(
+        (yield* Ref.get(chair.requests)).some((request) => request.startsWith("DELETE ")),
+      ).toBe(false);
+      expect(
+        (yield* Ref.get(boxPeer.requests)).some((request) => request.startsWith("DELETE ")),
+      ).toBe(true);
+      expect((yield* Ref.get(desk.requests)).some((request) => request.startsWith("DELETE "))).toBe(
+        true,
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("omits a link unlinked while its status probe is in flight", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1498,6 +1812,38 @@ it.effect("times out a probe whose initialize response never arrives", () =>
       const failed = yield* Fiber.join(probe);
       expect(failed.reason).toBe("unreachable");
       yield* Deferred.succeed(gate, undefined);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("does not report replacement reachability from a stale list probe", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* linkTo(a.links, b);
+      const gate = yield* Deferred.make<void>();
+      yield* Ref.set(b.mcpGate, gate);
+      const listing = yield* a.links.list.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(b.mcpStarted);
+
+      const replacement = descriptorOf(box.environmentId, "Replacement box");
+      yield* Ref.set(b.descriptor, replacement);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "read-only",
+      });
+      yield* Ref.set(b.descriptor, descriptorOf("environment-impostor", "Impostor"));
+      yield* Deferred.succeed(gate, undefined);
+
+      expect(
+        (yield* Fiber.join(listing)).map(({ label, access, status }) => ({
+          label,
+          access,
+          status,
+        })),
+      ).toEqual([{ label: "Replacement box", access: "read-only", status: "unreachable" }]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
