@@ -28,6 +28,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/http";
+import { AtomRegistry } from "effect/reactivity";
 import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
@@ -57,6 +58,7 @@ import {
   type ThreadSnapshotLoadResult,
 } from "./threads.ts";
 import * as ThreadSnapshotLoader from "./threadSnapshotHttp.ts";
+import { peerLinkCacheInvalidation } from "./peerLinks.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -135,6 +137,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const lastAcceptCompactTurnItems = yield* Ref.make<true | undefined>(undefined);
   const wakeups = yield* Queue.unbounded<ConnectionWakeups.ConnectionWakeup>();
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationV2ThreadDetailSnapshot>>([]);
+  const atomRegistry = AtomRegistry.make();
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
   const supervisorState = yield* SubscriptionRef.make<SupervisorConnectionState>(
     AVAILABLE_CONNECTION_STATE,
@@ -252,6 +255,9 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       ),
     );
   }
+  makeThreadState = makeThreadState.pipe(
+    Effect.provideService(AtomRegistry.AtomRegistry, atomRegistry),
+  );
   const historyController = yield* ThreadHistoryController.ThreadHistoryController.pipe(
     Effect.provide(ThreadHistoryController.layer),
   );
@@ -288,6 +294,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     supervisorState,
     supervisorSession,
     savedThreads,
+    atomRegistry,
     removedThreads,
     wakeups,
     replaceSession: SubscriptionRef.set(supervisorSession, Option.some(testSession(client))),
@@ -690,6 +697,50 @@ describe("EnvironmentThreads", () => {
       expect(live.sequence).toBe(CACHED_SNAPSHOT_SEQUENCE + 1);
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
+  it.effect("invalidates the outer peer-link list after a direct agent unlink", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_PROJECTION });
+      const signal = peerLinkCacheInvalidation(TARGET.environmentId);
+      const disposeSignal = harness.atomRegistry.mount(signal);
+      const linkedEnvironment = EnvironmentId.make("environment-peer");
+      const unlinkItem = {
+        id: TurnItemId.make("unlink-item"),
+        threadId: THREAD_ID,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed" as const,
+        title: null,
+        startedAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+        completedAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+        updatedAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+        type: "dynamic_tool" as const,
+        toolName: "t3_environment_unlink",
+        input: { environmentId: linkedEnvironment },
+        output: { environmentId: linkedEnvironment, removed: true },
+      } satisfies OrchestrationV2TurnItem;
+      yield* Queue.offer(harness.inputs, {
+        kind: "event",
+        sequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+        event: {
+          id: EventId.make("event-unlink"),
+          type: "turn-item.updated",
+          threadId: THREAD_ID,
+          occurredAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+          payload: unlinkItem,
+        },
+      });
+      yield* awaitThreadState(harness.observed, (state) => state.sequence === 8);
+      expect(harness.atomRegistry.get(signal)).toBe(1);
+      expect(harness.atomRegistry.get(peerLinkCacheInvalidation(linkedEnvironment))).toBe(0);
+      disposeSignal();
     }),
   );
 

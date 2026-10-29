@@ -66,6 +66,7 @@ export const servePeer = <E, R>(
     const descriptor = yield* Ref.make(initial);
     const bearers = yield* Ref.make<ReadonlyArray<string>>([]);
     const probes = yield* Ref.make(0);
+    const requests = yield* Ref.make<ReadonlyArray<string>>([]);
     const layerEnvironment = Layer.succeed(ServerEnvironment.ServerEnvironment, {
       getEnvironmentId: Ref.get(descriptor).pipe(Effect.map((current) => current.environmentId)),
       getDescriptor: Ref.get(descriptor),
@@ -88,6 +89,7 @@ export const servePeer = <E, R>(
             yield* Ref.update(probes, (count) => count + 1);
           }
           const authorization = request.headers.authorization;
+          yield* Ref.update(requests, (seen) => [...seen, `${request.method} ${request.url}`]);
           if (authorization !== undefined) {
             yield* Ref.update(bearers, (seen) => [...seen, authorization]);
           }
@@ -135,6 +137,7 @@ export const servePeer = <E, R>(
       bearers,
       /** How often its descriptor was asked for, as a probe of whether it answers. */
       probes,
+      requests,
       /** The sessions linking created there, which its Connections lists. */
       linkedSessions: auth
         .listSessions()

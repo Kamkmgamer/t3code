@@ -840,7 +840,9 @@ const make = Effect.gen(function* () {
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
         ...(claims.rtc ? { runtimeModeCeiling: claims.rtc } : {}),
-        ...(claims.plk === 1 ? { peerLink: true as const } : {}),
+        // Tokens issued before the peer-link claim was added still map to a
+        // linked session through the durable row backfilled by migration 073.
+        ...(claims.plk === 1 || row.value.peerLink ? { peerLink: true as const } : {}),
       } satisfies VerifiedSession;
     },
   );

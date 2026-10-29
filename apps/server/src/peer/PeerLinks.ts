@@ -21,9 +21,12 @@ import * as Base64Url from "effect/encoding/Base64Url";
 import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
@@ -79,6 +82,8 @@ export class PeerLinks extends Context.Service<
       Option.Option<{ readonly environmentId: EnvironmentId; readonly label: string }>
     >;
     readonly list: Effect.Effect<ReadonlyArray<PeerLinkSummary>, PeerLinkError>;
+    /** Emits after a link changes, including changes made directly by an agent. */
+    readonly subscribeRefreshes: Stream.Stream<number>;
     /** The stored link, without asking the peer whether it answers. */
     readonly get: (
       environmentId: EnvironmentId,
@@ -174,6 +179,12 @@ const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const refreshes = yield* PubSub.unbounded<number>();
+  const refreshRevision = yield* Ref.make(0);
+  const notifyRefresh = Ref.updateAndGet(refreshRevision, (revision) => revision + 1).pipe(
+    Effect.flatMap((revision) => PubSub.publish(refreshes, revision)),
+    Effect.asVoid,
+  );
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -500,16 +511,18 @@ const make = Effect.gen(function* () {
       ? Effect.succeed<PeerLinkStatus>("revoked")
       : DateTime.isLessThanOrEqualTo(link.expiresAt, now)
         ? Effect.succeed<PeerLinkStatus>("expired")
-        : Effect.findFirst(link.urls, (url) =>
-            describe(url).pipe(
-              Effect.map(
-                (found) => Option.isSome(found) && found.value.environmentId === link.environmentId,
-              ),
-            ),
-          ).pipe(
-            Effect.map((answered): PeerLinkStatus =>
-              Option.isSome(answered) ? "reachable" : "unreachable",
-            ),
+        : probe(link.environmentId).pipe(
+            Effect.as<PeerLinkStatus>("reachable"),
+            Effect.catchTags({
+              PeerLinkError: (error) =>
+                Effect.succeed<PeerLinkStatus>(
+                  error.reason === "revoked"
+                    ? "revoked"
+                    : error.reason === "expired"
+                      ? "expired"
+                      : "unreachable",
+                ),
+            }),
           );
 
   const list: PeerLinks["Service"]["list"] = Effect.gen(function* () {
@@ -541,6 +554,7 @@ const make = Effect.gen(function* () {
       for (const row of deleted) {
         yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
       }
+      if (deleted.length > 0) yield* notifyRefresh;
       return deleted.length > 0;
     },
   );
@@ -635,38 +649,41 @@ const make = Effect.gen(function* () {
   const probe: PeerLinks["Service"]["probe"] = Effect.fn("PeerLinks.probe")(
     function* (environmentId) {
       const resolved = yield* resolve(environmentId);
-      const response = yield* httpClient
-        .execute(
-          HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
-            HttpClientRequest.setHeaders({
-              accept: "application/json, text/event-stream",
-              authorization: `Bearer ${resolved.token}`,
+      const executeDrained = (request: HttpClientRequest.HttpClientRequest) =>
+        peerHttpClient
+          .execute(request)
+          .pipe(Effect.flatMap((response) => response.text.pipe(Effect.as(response))));
+      const response = yield* executeDrained(
+        HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+          HttpClientRequest.setHeaders({
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${resolved.token}`,
+            "mcp-protocol-version": "2025-06-18",
+          }),
+          HttpClientRequest.setBody(
+            HttpBody.jsonUnsafe({
+              jsonrpc: "2.0",
+              id: 0,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                clientInfo: { name: "t3code-peer-probe", version: "1" },
+              },
             }),
-            HttpClientRequest.setBody(
-              HttpBody.jsonUnsafe({
-                jsonrpc: "2.0",
-                id: 0,
-                method: "initialize",
-                params: {
-                  protocolVersion: "2025-06-18",
-                  capabilities: {},
-                  clientInfo: { name: "t3code-peer-probe", version: "1" },
-                },
-              }),
-            ),
           ),
-        )
-        .pipe(
-          Effect.timeout(probeTimeout(resolved.url)),
-          Effect.mapError(
-            (cause) =>
-              new PeerLinkError({
-                reason: "unreachable",
-                message: `${resolved.link.label} stopped answering while checking its link.`,
-                cause,
-              }),
-          ),
-        );
+        ),
+      ).pipe(
+        Effect.timeout(probeTimeout(resolved.url)),
+        Effect.mapError(
+          (cause) =>
+            new PeerLinkError({
+              reason: "unreachable",
+              message: `${resolved.link.label} stopped answering while checking its link.`,
+              cause,
+            }),
+        ),
+      );
       if (response.status === 401) {
         yield* recordOutcome(environmentId, resolved.secretName, {
           error: "The linked environment rejected this link (HTTP 401).",
@@ -689,6 +706,36 @@ const make = Effect.gen(function* () {
           message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
         });
       }
+      const sessionId = response.headers["mcp-session-id"];
+      if (sessionId === undefined) {
+        return yield* new PeerLinkError({
+          reason: "unreachable",
+          message: `${resolved.link.label} did not return an MCP session for the link check.`,
+        });
+      }
+      const sessionHeaders = {
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${resolved.token}`,
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": "2025-06-18",
+      };
+      const terminate = () =>
+        executeDrained(
+          HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
+            HttpClientRequest.setHeaders(sessionHeaders),
+          ),
+        ).pipe(Effect.ignore);
+      yield* Effect.ensuring(
+        executeDrained(
+          HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+            HttpClientRequest.setHeaders(sessionHeaders),
+            HttpClientRequest.setBody(
+              HttpBody.jsonUnsafe({ jsonrpc: "2.0", method: "notifications/initialized" }),
+            ),
+          ),
+        ).pipe(Effect.ignore),
+        terminate(),
+      );
       yield* recordOutcome(environmentId, resolved.secretName, { error: null });
       return resolved.link;
     },
@@ -699,6 +746,7 @@ const make = Effect.gen(function* () {
     link,
     describe: describeUrl,
     list,
+    subscribeRefreshes: Stream.fromPubSub(refreshes),
     get,
     unlink,
     resolve,

@@ -7,7 +7,6 @@ import {
   type OrchestrationV2ThreadStreamItem,
   type OrchestrationV2TurnItem,
   type ThreadId as ThreadIdType,
-  EnvironmentId,
 } from "@t3tools/contracts";
 import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -514,12 +513,9 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         if (turnItem.type !== "dynamic_tool" || turnItem.toolName !== "t3_environment_unlink") {
           continue;
         }
-        const input = turnItem.input;
-        if (typeof input !== "object" || input === null || !("environmentId" in input)) continue;
-        const environmentId = (input as { readonly environmentId?: unknown }).environmentId;
-        if (typeof environmentId === "string") {
-          invalidatePeerLinkCache(atomRegistry.value, EnvironmentId.make(environmentId));
-        }
+        // The list is cached on the environment that owns this thread. The
+        // tool input names the peer being forgotten, not that cache owner.
+        invalidatePeerLinkCache(atomRegistry.value, environmentId);
       }
     }
 

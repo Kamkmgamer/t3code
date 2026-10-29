@@ -288,6 +288,36 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
     ),
   );
 
+  it.effect("backfills peer-link identity for legacy tokens without plk", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const secrets = yield* ServerSecretStore.ServerSecretStore;
+      const sql = yield* SqlClient.SqlClient;
+      const issued = yield* sessions.issue({
+        subject: "mcp-client",
+        method: "bearer-access-token",
+        peerLink: true,
+      });
+      yield* sql`UPDATE auth_sessions SET peer_link = 1 WHERE session_id = ${issued.sessionId}`;
+      const [encodedPayload] = issued.token.split(".");
+      const currentClaims = base64UrlDecodeUtf8(encodedPayload!);
+      const legacyPayload = base64UrlEncode(currentClaims.replace(',"plk":1', ""));
+      const secret = yield* secrets.getOrCreateRandom("server-signing-key", 32);
+      const legacyToken = `${legacyPayload}.${signPayload(legacyPayload, secret)}`;
+
+      expect((yield* sessions.verify(legacyToken)).peerLink).toBe(true);
+    }).pipe(
+      Effect.provide(
+        SessionStore.layer.pipe(
+          Layer.provideMerge(ServerSecretStore.layer),
+          Layer.provideMerge(SqlitePersistence.layerMemory),
+          Layer.provide(layerServerEnvironment(EnvironmentId.make("test-environment"))),
+          Layer.provide(layerServerConfig()),
+        ),
+      ),
+    ),
+  );
+
   it.effect("atomically replaces active sessions with the same subject and method", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

@@ -4,10 +4,12 @@ import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool, Toolkit } from "effect/ai";
@@ -415,6 +417,23 @@ it.effect("keeps a revocation sticky when outcomes race within one link generati
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("publishes link refreshes for unlink operations", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes).pipe(Effect.forkScoped);
+      expect(yield* a.links.unlink(box.environmentId)).toBe(true);
+      expect(Option.isSome(yield* Fiber.join(refresh))).toBe(true);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("tells the agent to link again once the peer revokes the link or it expires", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -422,10 +441,17 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       const a = yield* makeA(laptop);
       const pairing = yield* b.auth.issuePairingCredential();
       yield* a.links.link({ url: b.url, pairingCode: pairing.credential, access: "auto" });
-      yield* probe(a);
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
+      const beforeProbeRequests = yield* Ref.get(b.requests);
+      expect(beforeProbeRequests.slice(-3).map((request) => request.split(" ")[0])).toEqual([
+        "POST",
+        "POST",
+        "DELETE",
+      ]);
 
       const [session] = yield* linkedSessions(b);
       yield* b.auth.revokeSession(session!.sessionId);
+      expect((yield* a.links.list).map((link) => link.status)).toEqual(["revoked"]);
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");
