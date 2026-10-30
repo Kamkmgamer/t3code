@@ -40,6 +40,7 @@ import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassifi
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { withManagedResponse } from "./PeerHttpResponse.ts";
 
 /** The redirect registered for a link. Nothing ever listens there: the code comes back in the response. */
 const LINK_REDIRECT_URI = "http://127.0.0.1/t3code-peer-link";
@@ -112,7 +113,7 @@ export class PeerLinks extends Context.Service<
       environmentId: EnvironmentId,
       secretName: string,
       outcome: { readonly error: string | null; readonly revoked?: boolean },
-    ) => Effect.Effect<void>;
+    ) => Effect.Effect<void, PeerLinkError>;
   }
 >()("t3/peer/PeerLinks") {}
 
@@ -516,39 +517,41 @@ const make = Effect.gen(function* () {
     yield* secrets
       .set(secretName, new TextEncoder().encode(issued.access_token))
       .pipe(Effect.catch(failStorage));
-    // A token no row names could never be removed.
-    const previous = yield* Effect.gen(function* () {
-      const urlsJson = yield* encodeUrls(origins).pipe(Effect.catch(failStorage));
-      const previous = yield* readRow(peer.environmentId);
-      yield* sql`
-        INSERT INTO peer_environment_links (
-          environment_id, secret_name, label, urls_json, access, linked_at, expires_at,
-          last_reached_at, last_error, fenced, revoked
-        ) VALUES (
-          ${linked.environmentId}, ${secretName}, ${linked.label}, ${urlsJson}, ${linked.access},
-          ${DateTime.formatIso(linked.linkedAt)}, ${DateTime.formatIso(linked.expiresAt)},
-          ${DateTime.formatIso(now)}, NULL, 1, 0
-        )
-        ON CONFLICT (environment_id) DO UPDATE SET
-          secret_name = excluded.secret_name,
-          fenced = excluded.fenced,
-          label = excluded.label,
-          urls_json = excluded.urls_json,
-          access = excluded.access,
-          linked_at = excluded.linked_at,
-          expires_at = excluded.expires_at,
-          last_reached_at = excluded.last_reached_at,
-          last_error = NULL,
-          revoked = 0
-      `.pipe(Effect.catch(failStorage));
-      return previous;
-    }).pipe(Effect.onError(() => secrets.remove(secretName).pipe(Effect.ignore)));
+    // Publish the committed generation before interruptible cleanup of its predecessor.
+    const previous = yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const urlsJson = yield* encodeUrls(origins).pipe(Effect.catch(failStorage));
+        const previous = yield* readRow(peer.environmentId);
+        yield* sql`
+          INSERT INTO peer_environment_links (
+            environment_id, secret_name, label, urls_json, access, linked_at, expires_at,
+            last_reached_at, last_error, fenced, revoked
+          ) VALUES (
+            ${linked.environmentId}, ${secretName}, ${linked.label}, ${urlsJson}, ${linked.access},
+            ${DateTime.formatIso(linked.linkedAt)}, ${DateTime.formatIso(linked.expiresAt)},
+            ${DateTime.formatIso(now)}, NULL, 1, 0
+          )
+          ON CONFLICT (environment_id) DO UPDATE SET
+            secret_name = excluded.secret_name,
+            fenced = excluded.fenced,
+            label = excluded.label,
+            urls_json = excluded.urls_json,
+            access = excluded.access,
+            linked_at = excluded.linked_at,
+            expires_at = excluded.expires_at,
+            last_reached_at = excluded.last_reached_at,
+            last_error = NULL,
+            revoked = 0
+        `.pipe(Effect.catch(failStorage));
+        yield* notifyRefresh(linked.environmentId, secretName);
+        return previous;
+      }),
+    ).pipe(Effect.onError(() => secrets.remove(secretName).pipe(Effect.ignore)));
     // Linking again replaces the old token. A racing link may leave its own
     // behind; it is unused either way.
     if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
       yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
     }
-    yield* notifyRefresh(linked.environmentId, secretName);
     return linked;
   });
 
@@ -636,13 +639,16 @@ const make = Effect.gen(function* () {
 
   const unlink: PeerLinks["Service"]["unlink"] = Effect.fn("PeerLinks.unlink")(
     function* (environmentId) {
-      const deleted = yield* sql<{ secret_name: string }>`
-        DELETE FROM peer_environment_links WHERE environment_id = ${environmentId}
-        RETURNING secret_name
-      `.pipe(Effect.catch(failStorage));
-      if (deleted.length > 0) {
-        for (const row of deleted) yield* notifyRefresh(environmentId, row.secret_name);
-      }
+      const deleted = yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const rows = yield* sql<{ secret_name: string }>`
+            DELETE FROM peer_environment_links WHERE environment_id = ${environmentId}
+            RETURNING secret_name
+          `.pipe(Effect.catch(failStorage));
+          for (const row of rows) yield* notifyRefresh(environmentId, row.secret_name);
+          return rows;
+        }),
+      );
       // Evict local caches as soon as the row is gone; retain the storage
       // failure if removing the now-unreferenced secret does not succeed.
       for (const row of deleted) {
@@ -720,8 +726,8 @@ const make = Effect.gen(function* () {
     environmentId,
     secretName,
     outcome,
-  ) =>
-    DateTime.now.pipe(
+  ) => {
+    const update = DateTime.now.pipe(
       Effect.flatMap((now) =>
         Effect.gen(function* () {
           const updated =
@@ -732,29 +738,31 @@ const make = Effect.gen(function* () {
                   WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
                     AND revoked = 0
                   RETURNING revoked
-                `
+                `.pipe(Effect.catch(failStorage))
               : yield* sql<{ revoked: number }>`
                   UPDATE peer_environment_links
                   SET last_error = ${outcome.error}${outcome.revoked === true ? sql`, revoked = 1` : sql``}
                   WHERE environment_id = ${environmentId} AND secret_name = ${secretName}
                     AND revoked = 0
                   RETURNING revoked
-                `;
+                `.pipe(Effect.catch(failStorage));
           if (outcome.revoked === true && updated.length > 0) {
             yield* notifyRefresh(environmentId, secretName);
           }
         }),
       ),
       Effect.asVoid,
-      Effect.ignoreCause({ log: true }),
     );
+    return outcome.revoked === true
+      ? Effect.uninterruptible(update)
+      : update.pipe(Effect.ignoreCause({ log: true }));
+  };
 
   const probe: PeerLinks["Service"]["probe"] = Effect.fn("PeerLinks.probe")(
     function* (environmentId) {
       const resolved = yield* resolve(environmentId);
       const request = (request: HttpClientRequest.HttpClientRequest) =>
         peerHttpClient.execute(request).pipe(
-          Effect.timeout(probeTimeout(resolved.url)),
           Effect.mapError(
             (cause) =>
               new PeerLinkError({
@@ -764,6 +772,23 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
+      const withResponse = <A, R, E, R2>(
+        acquire: Effect.Effect<HttpClientResponse.HttpClientResponse, PeerLinkError, R>,
+        use: (
+          response: HttpClientResponse.HttpClientResponse,
+          restore: <B, E2, R3>(effect: Effect.Effect<B, E2, R3>) => Effect.Effect<B, E2, R3>,
+        ) => Effect.Effect<A, E, R2>,
+        acquireTimeout = probeTimeout(resolved.url),
+      ) =>
+        withManagedResponse(acquire, use, {
+          acquireTimeout,
+          releaseTimeout: Duration.seconds(3),
+          onAcquireTimeout: () =>
+            new PeerLinkError({
+              reason: "unreachable",
+              message: `${resolved.link.label} stopped answering while checking its link.`,
+            }),
+        });
       const readResponse = (response: HttpClientResponse.HttpClientResponse) =>
         response.stream.pipe(
           Stream.runDrain,
@@ -777,8 +802,6 @@ const make = Effect.gen(function* () {
               }),
           ),
         );
-      const discardResponse = (response: HttpClientResponse.HttpClientResponse) =>
-        response.stream.pipe(Stream.runDrain, Effect.timeout(Duration.seconds(3)), Effect.ignore);
       const initRequest = HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
         HttpClientRequest.setHeaders({
           accept: "application/json, text/event-stream",
@@ -798,127 +821,141 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-      return yield* Effect.uninterruptibleMask((restore) =>
+      let sessionId: string | undefined;
+      const terminate = (id: string) => {
+        const sessionHeaders = {
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${resolved.token}`,
+          "mcp-session-id": id,
+          "mcp-protocol-version": "2025-06-18",
+        };
+        return Effect.uninterruptibleMask(() =>
+          Effect.interruptible(
+            withResponse(
+              request(
+                HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
+                  HttpClientRequest.setHeaders(sessionHeaders),
+                ),
+              ),
+              () => Effect.void,
+              Duration.seconds(3),
+            ),
+          ).pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
+        );
+      };
+      return yield* Effect.ensuring(
         Effect.gen(function* () {
-          const response = yield* restore(request(initRequest));
-          if (response.status === 401) {
-            yield* recordOutcome(environmentId, resolved.secretName, {
-              error: "The linked environment rejected this link (HTTP 401).",
-              revoked: true,
-            });
-            yield* restore(discardResponse(response));
-            return yield* new PeerLinkError({
-              reason: "revoked",
-              message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
-            });
-          }
-          if (response.status === 403) {
-            yield* restore(discardResponse(response));
-            return yield* new PeerLinkError({
-              reason: "unreachable",
-              message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
-            });
-          }
-          if (response.status !== 200) {
-            yield* restore(discardResponse(response));
-            return yield* new PeerLinkError({
-              reason: "unreachable",
-              message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
-            });
-          }
-          const sessionId = response.headers["mcp-session-id"];
-          if (sessionId === undefined) {
-            yield* restore(discardResponse(response));
-            return yield* new PeerLinkError({
-              reason: "unreachable",
-              message: `${resolved.link.label} did not return an MCP session for the link check.`,
-            });
-          }
+          const openedSessionId = yield* withResponse(
+            request(initRequest),
+            (response, restoreResponse) =>
+              Effect.gen(function* () {
+                if (response.status === 401) {
+                  yield* recordOutcome(environmentId, resolved.secretName, {
+                    error: "The linked environment rejected this link (HTTP 401).",
+                    revoked: true,
+                  });
+                  return yield* new PeerLinkError({
+                    reason: "revoked",
+                    message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
+                  });
+                }
+                if (response.status === 403) {
+                  return yield* new PeerLinkError({
+                    reason: "unreachable",
+                    message: `${resolved.link.label} has Linked environments turned off. Turn it on there, then try again.`,
+                  });
+                }
+                if (response.status !== 200) {
+                  return yield* new PeerLinkError({
+                    reason: "unreachable",
+                    message: `${resolved.link.label} refused the link check (HTTP ${response.status}).`,
+                  });
+                }
+                const headerSessionId = response.headers["mcp-session-id"];
+                if (headerSessionId === undefined) {
+                  return yield* new PeerLinkError({
+                    reason: "unreachable",
+                    message: `${resolved.link.label} did not return an MCP session for the link check.`,
+                  });
+                }
+                sessionId = headerSessionId;
+                yield* restoreResponse(readResponse(response));
+                return headerSessionId;
+              }),
+          );
           const sessionHeaders = {
             accept: "application/json, text/event-stream",
             authorization: `Bearer ${resolved.token}`,
-            "mcp-session-id": sessionId,
+            "mcp-session-id": openedSessionId,
             "mcp-protocol-version": "2025-06-18",
           };
-          const terminate = () =>
-            Effect.uninterruptibleMask(() =>
-              Effect.interruptible(
-                request(
-                  HttpClientRequest.make("DELETE")(`${resolved.url}/mcp`).pipe(
-                    HttpClientRequest.setHeaders(sessionHeaders),
-                  ),
-                ).pipe(Effect.flatMap(discardResponse)),
-              ).pipe(Effect.timeout(Duration.seconds(3)), Effect.ignore),
-            );
-          yield* Effect.ensuring(
-            Effect.uninterruptibleMask((restore) =>
+          yield* withResponse(
+            request(
+              HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
+                HttpClientRequest.setHeaders(sessionHeaders),
+                HttpClientRequest.setBody(
+                  HttpBody.jsonUnsafe({
+                    jsonrpc: "2.0",
+                    method: "notifications/initialized",
+                  }),
+                ),
+              ),
+            ),
+            (notification, restoreResponse) =>
               Effect.gen(function* () {
-                yield* restore(readResponse(response));
-                const notification = yield* restore(
-                  request(
-                    HttpClientRequest.post(`${resolved.url}/mcp`).pipe(
-                      HttpClientRequest.setHeaders(sessionHeaders),
-                      HttpClientRequest.setBody(
-                        HttpBody.jsonUnsafe({
-                          jsonrpc: "2.0",
-                          method: "notifications/initialized",
-                        }),
-                      ),
-                    ),
-                  ),
-                );
                 if (notification.status === 401) {
                   yield* recordOutcome(environmentId, resolved.secretName, {
                     error: "The linked environment rejected this link (HTTP 401).",
                     revoked: true,
                   });
-                  yield* restore(discardResponse(notification));
                   return yield* new PeerLinkError({
                     reason: "revoked",
                     message: `The link to ${resolved.link.label} was revoked there. Link it again with a new pairing code from ${resolved.link.label}.`,
                   });
                 }
                 if (notification.status < 200 || notification.status >= 300) {
-                  yield* restore(discardResponse(notification));
                   return yield* new PeerLinkError({
                     reason: "unreachable",
                     message: `${resolved.link.label} refused the link check (HTTP ${notification.status}).`,
                   });
                 }
-                yield* restore(readResponse(notification));
+                yield* restoreResponse(readResponse(notification));
               }),
-            ),
-            terminate(),
           );
-          yield* restore(recordOutcome(environmentId, resolved.secretName, { error: null }));
-          const currentRow = yield* readRow(environmentId);
-          if (Option.isNone(currentRow)) {
-            return yield* new PeerLinkError({
-              reason: "unknown_link",
-              message: "The link was removed while it was being checked.",
-            });
-          }
-          if (currentRow.value.secret_name !== resolved.secretName) {
-            return yield* new PeerLinkError({
-              reason: "unknown_link",
-              message: "The link changed while it was being checked. Try again.",
-            });
-          }
-          const currentLink = yield* toLink(currentRow.value);
-          if (currentRow.value.revoked === 1) {
-            return yield* new PeerLinkError({
-              reason: "revoked",
-              message: `The link to ${currentLink.label} was revoked there. Link it again with a new pairing code from ${currentLink.label}.`,
-            });
-          }
-          if (DateTime.isLessThanOrEqualTo(currentLink.expiresAt, yield* DateTime.now)) {
-            return yield* new PeerLinkError({
-              reason: "expired",
-              message: `The link to ${currentLink.label} expired. Link it again with a new pairing code from ${currentLink.label}.`,
-            });
-          }
-          return currentLink;
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* restore(recordOutcome(environmentId, resolved.secretName, { error: null }));
+              const currentRow = yield* readRow(environmentId);
+              if (Option.isNone(currentRow)) {
+                return yield* new PeerLinkError({
+                  reason: "unknown_link",
+                  message: "The link was removed while it was being checked.",
+                });
+              }
+              if (currentRow.value.secret_name !== resolved.secretName) {
+                return yield* new PeerLinkError({
+                  reason: "unknown_link",
+                  message: "The link changed while it was being checked. Try again.",
+                });
+              }
+              const currentLink = yield* toLink(currentRow.value);
+              if (currentRow.value.revoked === 1) {
+                return yield* new PeerLinkError({
+                  reason: "revoked",
+                  message: `The link to ${currentLink.label} was revoked there. Link it again with a new pairing code from ${currentLink.label}.`,
+                });
+              }
+              if (DateTime.isLessThanOrEqualTo(currentLink.expiresAt, yield* DateTime.now)) {
+                return yield* new PeerLinkError({
+                  reason: "expired",
+                  message: `The link to ${currentLink.label} expired. Link it again with a new pairing code from ${currentLink.label}.`,
+                });
+              }
+              return currentLink;
+            }),
+          );
         }),
+        Effect.suspend(() => (sessionId === undefined ? Effect.void : terminate(sessionId))),
       );
     },
   );

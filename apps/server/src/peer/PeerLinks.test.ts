@@ -20,6 +20,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool, Toolkit } from "effect/ai";
 import {
@@ -323,6 +324,140 @@ const callPeerTool = (a: Effect.Success<ReturnType<typeof makeA>>) =>
     success: Probe,
   });
 
+const layerWithPausedSecretRemoval = (
+  active: Ref.Ref<boolean>,
+  started: Deferred.Deferred<void>,
+  release: Deferred.Deferred<void>,
+) =>
+  Layer.effect(
+    ServerSecretStore.ServerSecretStore,
+    Effect.map(ServerSecretStore.make, (store) =>
+      ServerSecretStore.ServerSecretStore.of({
+        ...store,
+        remove: (name) =>
+          Effect.gen(function* () {
+            if (yield* Ref.get(active)) {
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+            }
+            yield* store.remove(name);
+          }),
+      }),
+    ),
+  );
+
+const verifyRevocationResponseOwnership = (
+  stage:
+    | "tool initialize"
+    | "tool notification"
+    | "tool response"
+    | "probe initialize"
+    | "probe notification",
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let bodyStarted = false;
+      let releasePull = () => {};
+      const bodyCancelled = makeTestSignal<void>();
+      const bodyReleased = makeTestSignal<void>();
+      const readerStarted = makeTestSignal<void>();
+      const responseObserved = yield* Deferred.make<void>();
+      const writeStarted = yield* Deferred.make<void>();
+      const releaseWrite = yield* Deferred.make<void>();
+      const active = yield* Ref.make(false);
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        layerHttpClientResponseTransform((request, response) =>
+          Effect.gen(function* () {
+            if (
+              !(yield* Ref.get(active)) ||
+              request.method !== "POST" ||
+              request.url.endsWith("/mcp") === false ||
+              response.status !== 401
+            ) {
+              return response;
+            }
+            yield* Deferred.succeed(responseObserved, undefined);
+            const body = new ReadableStream<Uint8Array>({
+              pull() {
+                bodyStarted = true;
+                readerStarted.resolve(undefined);
+                return new Promise<void>((resolve) => {
+                  releasePull = resolve;
+                });
+              },
+              cancel() {
+                releasePull();
+                bodyCancelled.resolve(undefined);
+                bodyReleased.resolve(undefined);
+              },
+            });
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(body, { status: response.status, headers: response.headers }),
+            );
+          }),
+        ),
+      );
+      yield* linkTo(a.links, b);
+
+      if (stage === "tool response") {
+        yield* callPeerTool(a);
+        yield* Ref.set(b.sessionResponse, { status: 401 });
+      } else if (stage === "tool notification" || stage === "probe notification") {
+        yield* Ref.set(b.mcpNotificationStatus, 401);
+      } else {
+        yield* Ref.set(b.initializeResponse, { status: 401 });
+      }
+      yield* Ref.set(active, true);
+
+      const pending = yield* (
+        stage.startsWith("probe")
+          ? a.links.probe(box.environmentId).pipe(Effect.ignore)
+          : callPeerTool(a).pipe(Effect.ignore)
+      ).pipe(
+        Effect.provideService(Statement.CurrentTransformer, (statement) => {
+          const [query] = statement.compile();
+          if (!query.includes("UPDATE peer_environment_links") || !query.includes("revoked = 1")) {
+            return Effect.succeed(statement);
+          }
+          return Deferred.succeed(writeStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWrite)),
+            Effect.as(statement),
+          );
+        }),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+
+      yield* Deferred.await(responseObserved);
+      yield* Deferred.await(writeStarted);
+      expect(bodyStarted).toBe(false);
+
+      const interruption = yield* Fiber.interrupt(pending).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(releaseWrite, undefined);
+      const phase = yield* Effect.raceFirst(
+        readerStarted.wait.pipe(Effect.as("reader started" as const)),
+        Fiber.join(interruption).pipe(Effect.as("interrupted" as const)),
+      );
+      expect(phase).toBe("reader started");
+      if (phase === "reader started") {
+        yield* TestClock.adjust(Duration.seconds(3));
+        yield* TestClock.adjust(Duration.seconds(3));
+        yield* Fiber.join(interruption);
+        yield* bodyCancelled.wait;
+        yield* bodyReleased.wait;
+        expect(bodyStarted).toBe(true);
+      }
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest));
+
 const verifyInitialize401BodyOwnership = (
   path: "probe" | "tool",
   behavior: "stall" | "fail" | "interrupted",
@@ -392,7 +527,11 @@ const verifyInitialize401BodyOwnership = (
           yield* TestClock.adjust(Duration.seconds(3));
           expect(Exit.isFailure(yield* Fiber.join(pending))).toBe(true);
         } else {
-          yield* Fiber.interrupt(pending);
+          const interruption = yield* Fiber.interrupt(pending).pipe(
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* TestClock.adjust(Duration.seconds(3));
+          yield* Fiber.join(interruption);
         }
         if (behavior === "interrupted") yield* bodyCancelled.wait;
       }
@@ -891,6 +1030,98 @@ it.effect.each(["stall", "fail", "interrupted"] as const)(
   (behavior) => verifyInitialize401BodyOwnership("probe", behavior),
 );
 
+it.effect.each([
+  "tool initialize",
+  "tool notification",
+  "tool response",
+  "probe initialize",
+  "probe notification",
+] as const)("releases a %s 401 response interrupted during generation persistence", (stage) =>
+  verifyRevocationResponseOwnership(stage),
+);
+
+it.effect("surfaces a failed 401 revocation write and recovers when storage returns", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let bodyStarted = false;
+      let releasePull = () => {};
+      const bodyCancelled = makeTestSignal<void>();
+      const readerStarted = makeTestSignal<void>();
+      const responseObserved = yield* Deferred.make<void>();
+      const active = yield* Ref.make(false);
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        undefined,
+        layerHttpClientResponseTransform((request, response) =>
+          Effect.gen(function* () {
+            if (
+              !(yield* Ref.get(active)) ||
+              request.method !== "POST" ||
+              request.url.endsWith("/mcp") === false ||
+              response.status !== 401
+            ) {
+              return response;
+            }
+            yield* Deferred.succeed(responseObserved, undefined);
+            const body = new ReadableStream<Uint8Array>({
+              pull() {
+                bodyStarted = true;
+                readerStarted.resolve(undefined);
+                return new Promise<void>((resolve) => {
+                  releasePull = resolve;
+                });
+              },
+              cancel() {
+                releasePull();
+                bodyCancelled.resolve(undefined);
+              },
+            });
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(body, { status: response.status, headers: response.headers }),
+            );
+          }),
+        ),
+      );
+      yield* linkTo(a.links, b);
+      yield* a.sql.unsafe(`
+        CREATE TRIGGER fail_peer_link_revoke
+        BEFORE UPDATE ON peer_environment_links
+        WHEN NEW.revoked = 1
+        BEGIN SELECT RAISE(ABORT, 'blocked peer link revocation'); END
+      `);
+      yield* Ref.set(b.initializeResponse, { status: 401 });
+      yield* Ref.set(active, true);
+
+      const pending = yield* callPeerTool(a).pipe(
+        Effect.flip,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.await(responseObserved);
+      expect(bodyStarted).toBe(false);
+      yield* readerStarted.wait;
+      yield* TestClock.adjust(Duration.seconds(3));
+      yield* TestClock.adjust(Duration.seconds(3));
+      const failed = yield* Fiber.join(pending);
+      expect(failed).toMatchObject({ code: "orchestration_error" });
+      expect(failed.message).toContain("could not be read or saved");
+      yield* bodyCancelled.wait;
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(false),
+      );
+
+      yield* a.sql.unsafe("DROP TRIGGER fail_peer_link_revoke");
+      yield* Ref.set(active, false);
+      const recovered = yield* callPeerTool(a).pipe(Effect.flip);
+      expect(recovered).toMatchObject({ code: "capability_denied" });
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(true),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("revokes a tool link when HTTP 401 has a pending initialize body", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1212,6 +1443,140 @@ it.effect("keeps a revocation sticky when outcomes race within one link generati
       expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
         Option.some(true),
       );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("publishes a relink before interrupted predecessor-secret cleanup", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const removalActive = yield* Ref.make(false);
+      const removalStarted = yield* Deferred.make<void>();
+      const releaseRemoval = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        layerWithPausedSecretRemoval(removalActive, removalStarted, releaseRemoval),
+      );
+      yield* linkTo(a.links, b);
+      yield* callPeerTool(a);
+      const oldGeneration = (yield* a.links.currentGenerations).find(
+        (generation) => generation.environmentId === box.environmentId,
+      )!;
+      yield* Ref.set(removalActive, true);
+
+      const relinking = yield* a.links
+        .link({
+          url: b.url,
+          pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+          access: "read-only",
+        })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(removalStarted);
+      const current = (yield* a.links.currentGenerations).find(
+        (generation) => generation.environmentId === box.environmentId,
+      )!;
+      const refresh = yield* Stream.runHead(a.links.subscribeRefreshes);
+      expect(current.secretName).not.toBe(oldGeneration.secretName);
+      expect(Option.map(refresh, ({ revision, secretName }) => ({ revision, secretName }))).toEqual(
+        Option.some({ revision: 2, secretName: current.secretName }),
+      );
+
+      yield* Fiber.interrupt(relinking);
+      expect(Exit.isFailure(yield* Fiber.await(relinking))).toBe(true);
+      yield* Deferred.await(b.mcpDeleteStarted);
+      expect(Option.map(yield* a.links.get(box.environmentId), (link) => link.revoked)).toEqual(
+        Option.some(false),
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("publishes an unlink when interruption arrives during its delete statement", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const deleteStarted = yield* Deferred.make<void>();
+      const releaseDelete = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      yield* linkTo(a.links, b);
+      yield* callPeerTool(a);
+      const generation = (yield* a.links.currentGenerations).find(
+        (current) => current.environmentId === box.environmentId,
+      )!;
+      const holdDelete: Statement.Transformer = (statement) => {
+        const [query] = statement.compile();
+        if (!query.includes("DELETE FROM peer_environment_links")) {
+          return Effect.succeed(statement);
+        }
+        return Deferred.succeed(deleteStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseDelete)),
+          Effect.as(statement),
+        );
+      };
+      const unlinking = yield* a.links
+        .unlink(box.environmentId)
+        .pipe(
+          Effect.provideService(Statement.CurrentTransformer, holdDelete),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+      yield* Deferred.await(deleteStarted);
+      const interruption = yield* Fiber.interrupt(unlinking).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(releaseDelete, undefined);
+      yield* Fiber.join(interruption);
+      expect(Exit.isFailure(yield* Fiber.await(unlinking))).toBe(true);
+      expect(Option.isNone(yield* a.links.get(box.environmentId))).toBe(true);
+      expect(
+        Option.map(
+          yield* Stream.runHead(a.links.subscribeRefreshes),
+          ({ revision, secretName }) => ({
+            revision,
+            secretName,
+          }),
+        ),
+      ).toEqual(Option.some({ revision: 2, secretName: generation.secretName }));
+      yield* Deferred.await(b.mcpDeleteStarted);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("publishes an unlink before interrupted secret cleanup", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const removalActive = yield* Ref.make(false);
+      const removalStarted = yield* Deferred.make<void>();
+      const releaseRemoval = yield* Deferred.make<void>();
+      const b = yield* serveB(box);
+      const a = yield* makeA(
+        laptop,
+        layerWithPausedSecretRemoval(removalActive, removalStarted, releaseRemoval),
+      );
+      yield* linkTo(a.links, b);
+      yield* callPeerTool(a);
+      yield* Ref.set(removalActive, true);
+      const generation = (yield* a.links.currentGenerations).find(
+        (current) => current.environmentId === box.environmentId,
+      )!;
+
+      const unlinking = yield* a.links
+        .unlink(box.environmentId)
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(removalStarted);
+      expect(Option.isNone(yield* a.links.get(box.environmentId))).toBe(true);
+      expect(
+        Option.map(
+          yield* Stream.runHead(a.links.subscribeRefreshes),
+          ({ revision, secretName }) => ({
+            revision,
+            secretName,
+          }),
+        ),
+      ).toEqual(Option.some({ revision: 2, secretName: generation.secretName }));
+      yield* Fiber.interrupt(unlinking);
+      expect(Exit.isFailure(yield* Fiber.await(unlinking))).toBe(true);
+      yield* Deferred.await(b.mcpDeleteStarted);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
