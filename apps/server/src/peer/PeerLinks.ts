@@ -40,7 +40,7 @@ import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassifi
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { withManagedResponse } from "./PeerHttpResponse.ts";
+import { makePeerHttpClient, withManagedResponse } from "./PeerHttpResponse.ts";
 
 /** The redirect registered for a link. Nothing ever listens there: the code comes back in the response. */
 const LINK_REDIRECT_URI = "http://127.0.0.1/t3code-peer-link";
@@ -196,6 +196,7 @@ const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;
   const httpClient = yield* HttpClient.HttpClient;
+  const fetch = yield* FetchHttpClient.Fetch;
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const refreshChanges = yield* PubSub.sliding<PeerLinkRefresh>({ capacity: 1, replay: 1 });
@@ -225,9 +226,7 @@ const make = Effect.gen(function* () {
 
   // Only the origin `peerOrigin` checked may receive a pairing code or token:
   // a redirect could forward them anywhere, including plain http.
-  const peerHttpClient = HttpClient.transform(httpClient, (response) =>
-    Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
-  );
+  const peerHttpClient = makePeerHttpClient(httpClient, fetch);
 
   const clientFor = (origin: string) =>
     HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin }).pipe(

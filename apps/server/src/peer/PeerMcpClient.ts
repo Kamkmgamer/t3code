@@ -22,7 +22,7 @@ import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as PeerLinks from "./PeerLinks.ts";
-import { withManagedResponse } from "./PeerHttpResponse.ts";
+import { makePeerHttpClient, withManagedResponse } from "./PeerHttpResponse.ts";
 
 /** The only MCP protocol version a T3 Code `/mcp` registers. */
 const PROTOCOL_VERSION = "2025-06-18";
@@ -118,9 +118,8 @@ const responseJson = (contentType: string | undefined, text: string) =>
 const make = Effect.gen(function* () {
   const links = yield* PeerLinks.PeerLinks;
   const httpClient = yield* HttpClient.HttpClient;
-  const peerHttpClient = HttpClient.transform(httpClient, (response) =>
-    Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
-  );
+  const fetch = yield* FetchHttpClient.Fetch;
+  const peerHttpClient = makePeerHttpClient(httpClient, fetch);
   type Session = {
     environmentId: EnvironmentId;
     url: string;

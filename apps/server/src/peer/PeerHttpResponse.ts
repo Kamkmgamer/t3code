@@ -3,9 +3,61 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
 import type * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 type Restore = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+
+/** Keeps host stream cancellation promises outside the managed Effect cleanup fiber. */
+export const withNonBlockingBodyCancellation =
+  (fetch: typeof globalThis.fetch): typeof globalThis.fetch =>
+  async (input, init) => {
+    const response = await fetch(input, init);
+    const body = response.body;
+    if (body === null) return response;
+
+    const boundedBody = new Proxy(body, {
+      get: (target, property) => {
+        if (property !== "getReader") return Reflect.get(target, property, target);
+        return () => {
+          const reader = target.getReader();
+          return {
+            get closed() {
+              return reader.closed;
+            },
+            read: () => reader.read(),
+            cancel: (reason?: unknown) => {
+              void reader.cancel(reason).catch(() => undefined);
+              return Promise.resolve();
+            },
+            releaseLock: () => reader.releaseLock(),
+          } satisfies ReadableStreamDefaultReader<Uint8Array>;
+        };
+      },
+    });
+
+    return new Proxy(response, {
+      get: (target, property) => {
+        if (property === "body") return boundedBody;
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+
+export const makePeerHttpClient = (
+  httpClient: HttpClient.HttpClient,
+  fetch: typeof globalThis.fetch,
+): HttpClient.HttpClient => {
+  const boundedFetch = withNonBlockingBodyCancellation(fetch);
+  return HttpClient.transform(httpClient, (response) =>
+    response.pipe(
+      Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+      Effect.provideService(FetchHttpClient.Fetch, boundedFetch),
+    ),
+  );
+};
 
 const releaseResponse = Effect.fn("PeerHttpResponse.releaseResponse")(function* (
   response: HttpClientResponse.HttpClientResponse,
